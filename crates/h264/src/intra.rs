@@ -287,9 +287,17 @@ pub fn pred16x16(plane: &mut [u8], stride: usize, x: usize, y: usize, mode: u8, 
     }
 }
 
-/// Chroma intra prediction for a 4:2:0 macroblock (8x8 block at chroma (x, y)), 8.3.4.
-/// Modes: 0 DC, 1 horizontal, 2 vertical, 3 plane.
+/// [`pred_chroma_halves`] with one availability for all left samples.
+#[cfg(test)]
 pub fn pred_chroma(plane: &mut [u8], stride: usize, x: usize, y: usize, mode: u8, a: Avail) {
+    pred_chroma_halves(plane, stride, x, y, mode, a, [a.left; 2]);
+}
+
+/// Chroma intra prediction for a 4:2:0 macroblock (8x8 block at chroma (x, y)), 8.3.4.
+/// Modes: 0 DC, 1 horizontal, 2 vertical, 3 plane. The left samples of the upper and lower four
+/// rows may differ in availability (MBAFF with constrained intra prediction): DC prediction of
+/// each 4x4 block uses the left samples of its own rows (8.3.4.1 - 8.3.4.3).
+pub fn pred_chroma_halves(plane: &mut [u8], stride: usize, x: usize, y: usize, mode: u8, a: Avail, left_half: [bool; 2]) {
     const W: usize = 8;
     const H: usize = 8;
     let mut top = [0i32; W];
@@ -299,8 +307,8 @@ pub fn pred_chroma(plane: &mut [u8], stride: usize, x: usize, y: usize, mode: u8
             top[i] = plane[(y - 1) * stride + x + i] as i32;
         }
     }
-    if a.left {
-        for i in 0..H {
+    for i in 0..H {
+        if left_half[i / 4] {
             left[i] = plane[(y + i) * stride + x - 1] as i32;
         }
     }
@@ -311,6 +319,7 @@ pub fn pred_chroma(plane: &mut [u8], stride: usize, x: usize, y: usize, mode: u8
                 for bx in 0..W / 4 {
                     let st: i32 = top[bx * 4..bx * 4 + 4].iter().sum();
                     let sl: i32 = left[by * 4..by * 4 + 4].iter().sum();
+                    let a = Avail { left: left_half[by], ..a };
                     let dc = if (bx == 0 && by == 0) || (bx > 0 && by > 0) {
                         match (a.top, a.left) {
                             (true, true) => (st + sl + 4) >> 3,

@@ -12,6 +12,7 @@ use crate::slice::{SliceHeader, SliceType};
 use crate::tables::*;
 use crate::transform::{self, LevelScale};
 use filmcraft_bitstream::BitReader;
+use std::sync::Arc;
 
 /// Per-slice data kept with the picture (deblocking, motion field export).
 #[derive(Clone, Debug, Default)]
@@ -25,13 +26,23 @@ pub struct SliceInfo {
 
 /// The picture under construction: private reconstruction buffers plus the shared [`Frame`] that
 /// finished (deblocked) macroblock rows are published into.
+///
+/// A field picture of an interlaced stream has its own (half-height) buffers and macroblock grid;
+/// frame pictures of interlaced streams publish pairs of macroblock rows (one field row each).
 pub struct PicState {
     pub planes: Planes,
     pub mbs: Vec<MbState>,
     pub slices: Vec<SliceInfo>,
+    /// Macroblock grid of the coded picture (rows of one field for a field picture).
     pub mb_w: usize,
     pub mb_h: usize,
+    /// PicOrderCnt of the picture (of the field for a field picture).
     pub poc: i32,
+    /// TopFieldOrderCnt / BottomFieldOrderCnt (a field picture: its own order count at its parity).
+    pub field_poc: [i32; 2],
+    pub structure: Structure,
+    /// MBAFF frame (`mb_adaptive_frame_field_flag` and a frame picture).
+    pub mbaff: bool,
     pub decoded_mbs: usize,
     pub frame: FrameRef,
     /// Decoded macroblocks per MB row.
@@ -45,15 +56,18 @@ pub struct PicState {
 }
 
 impl PicState {
-    pub fn new(frame: FrameRef) -> Self {
-        let (mb_w, mb_h) = (frame.mb_w, frame.mb_h());
+    pub fn new(frame: FrameRef, structure: Structure, mbaff: bool, poc: i32, field_poc: [i32; 2]) -> Self {
+        let (mb_w, mb_h) = Self::grid(&frame, structure);
         PicState {
             planes: Planes::new(mb_w * 16, mb_h * 16),
             mbs: vec![MbState::default(); mb_w * mb_h],
             slices: Vec::new(),
             mb_w,
             mb_h,
-            poc: frame.poc,
+            poc,
+            field_poc,
+            structure,
+            mbaff,
             decoded_mbs: 0,
             frame,
             row_count: vec![0; mb_h],
@@ -64,15 +78,27 @@ impl PicState {
         }
     }
 
-    /// Reuse the buffers of a finished picture of the same size for a new frame.
-    pub fn reset(&mut self, frame: FrameRef) {
-        debug_assert_eq!((self.mb_w, self.mb_h), (frame.mb_w, frame.mb_h()));
+    fn grid(frame: &Frame, structure: Structure) -> (usize, usize) {
+        if structure.is_field() && frame.interlaced { (frame.mb_w, frame.field_mb_h()) } else { (frame.mb_w, frame.mb_h()) }
+    }
+
+    /// The buffers can be reused for `structure` of `frame`.
+    pub fn fits(&self, frame: &Frame, structure: Structure) -> bool {
+        Self::grid(frame, structure) == (self.mb_w, self.mb_h)
+    }
+
+    /// Reuse the buffers of a finished picture of the same size for a new picture.
+    pub fn reset(&mut self, frame: FrameRef, structure: Structure, mbaff: bool, poc: i32, field_poc: [i32; 2]) {
+        debug_assert!(self.fits(&frame, structure));
         // start_mb() re-initialises each macroblock before use; only availability must be reset
         for m in &mut self.mbs {
             m.slice_num = u32::MAX;
         }
         self.slices.clear();
-        self.poc = frame.poc;
+        self.poc = poc;
+        self.field_poc = field_poc;
+        self.structure = structure;
+        self.mbaff = mbaff;
         self.decoded_mbs = 0;
         self.frame = frame;
         self.row_count.fill(0);
@@ -82,13 +108,14 @@ impl PicState {
         self.skip_deblock = false;
     }
 
-    /// Record a decoded macroblock and deblock / publish rows that became final.
+    /// Record a decoded macroblock (index into `mbs`) and deblock / publish rows that became final.
     #[inline]
-    pub fn mb_done(&mut self, addr: usize) {
+    pub fn mb_done(&mut self, idx: usize) {
         self.decoded_mbs += 1;
-        let r = addr / self.mb_w;
-        self.row_count[r] += 1;
-        if self.row_count[r] as usize >= self.mb_w && r == self.rows_recon {
+        let r = idx / self.mb_w;
+        let Some(c) = self.row_count.get_mut(r) else { return };
+        *c += 1;
+        if *c as usize >= self.mb_w && r == self.rows_recon {
             while self.rows_recon < self.mb_h && self.row_count[self.rows_recon] as usize >= self.mb_w {
                 self.rows_recon += 1;
             }
@@ -100,28 +127,119 @@ impl PicState {
     /// missing macroblocks, so that waiting readers never block forever).
     pub fn flush_rows(&mut self, finished: bool) {
         // Deblocking row r must wait until row r + 1 is reconstructed (its intra prediction reads the
-        // unfiltered bottom line of row r); row r is final once row r + 1 is deblocked.
-        let deblock_limit = if finished { self.mb_h } else { self.rows_recon.saturating_sub(1) };
-        while self.rows_deblocked < deblock_limit {
-            let r = self.rows_deblocked;
-            if !self.skip_deblock {
-                for addr in r * self.mb_w..(r + 1) * self.mb_w {
-                    deblock::deblock_mb(self, addr, self.mb_w);
+        // unfiltered bottom line of row r); row r is final once row r + 1 is deblocked. MBAFF
+        // frames work in macroblock pair rows, deblocked in macroblock address order.
+        if self.mbaff {
+            let pairs_recon = self.rows_recon / 2;
+            let limit = if finished { self.mb_h.div_ceil(2) } else { pairs_recon.saturating_sub(1) };
+            while self.rows_deblocked / 2 < limit {
+                let py = self.rows_deblocked / 2;
+                if !self.skip_deblock {
+                    for x in 0..self.mb_w {
+                        for b in 0..2 {
+                            let y = py * 2 + b;
+                            if y < self.mb_h {
+                                deblock::deblock_mb_mbaff(self, y * self.mb_w + x, self.mb_w);
+                            }
+                        }
+                    }
+                }
+                self.rows_deblocked = (self.rows_deblocked + 2).min(self.mb_h);
+            }
+        } else {
+            let deblock_limit = if finished { self.mb_h } else { self.rows_recon.saturating_sub(1) };
+            while self.rows_deblocked < deblock_limit {
+                let r = self.rows_deblocked;
+                if !self.skip_deblock {
+                    for addr in r * self.mb_w..(r + 1) * self.mb_w {
+                        deblock::deblock_mb(self, addr, self.mb_w);
+                    }
+                }
+                self.rows_deblocked += 1;
+            }
+        }
+        let final_rows = if finished { self.mb_h } else { self.rows_deblocked.saturating_sub(if self.mbaff { 2 } else { 1 }) };
+        if !self.frame.interlaced {
+            while self.rows_published < final_rows {
+                let r = self.rows_published;
+                let slices = &self.slices;
+                let ids =
+                    |st: &MbState, l: usize, ri: i8| slices.get(st.slice_num as usize).and_then(|s| s.ref_ids[l].get(ri as usize).copied()).unwrap_or(u32::MAX);
+                let row = Frame::make_row(&self.planes, r, &self.mbs, &ids);
+                self.frame.publish(r, row);
+                self.rows_published += 1;
+            }
+            return;
+        }
+        match self.structure.parity() {
+            Some(p) => {
+                if final_rows > self.rows_published {
+                    self.frame.publish_field_planes(p, &self.planes, self.rows_published, final_rows);
+                    self.rows_published = final_rows;
                 }
             }
-            self.rows_deblocked += 1;
+            None => {
+                let pairs = final_rows / 2;
+                if pairs > self.rows_published / 2 {
+                    self.frame.publish_frame_planes(&self.planes, self.rows_published / 2, pairs);
+                    self.rows_published = pairs * 2;
+                }
+            }
         }
-        let publish_limit = if finished { self.mb_h } else { self.rows_deblocked.saturating_sub(1) };
-        while self.rows_published < publish_limit {
-            let r = self.rows_published;
-            let slices = &self.slices;
-            let ids =
-                |st: &MbState, l: usize, ri: i8| slices.get(st.slice_num as usize).and_then(|s| s.ref_ids[l].get(ri as usize).copied()).unwrap_or(u32::MAX);
-            let row = Frame::make_row(&self.planes, r, &self.mbs, &ids);
-            self.frame.publish(r, row);
-            self.rows_published += 1;
+        if finished {
+            self.publish_col();
         }
     }
+
+    /// Identity of the picture referenced by `ri` of list `l` of macroblock `st` (MBAFF field
+    /// macroblocks index the field list of their parity).
+    pub fn ref_id(&self, st: &MbState, mb_parity: u8, l: usize, ri: i8) -> u32 {
+        ref_id_of(&self.slices, self.mbaff, st, mb_parity, l, ri)
+    }
+
+    /// Publish the motion data used for direct prediction by later pictures (interlaced streams).
+    fn publish_col(&self) {
+        let kind = match (self.structure.is_field(), self.mbaff) {
+            (true, _) => ColKind::Fld,
+            (false, true) => ColKind::Afrm,
+            (false, false) => ColKind::Frm,
+        };
+        let mut col = ColPic::intra(kind, self.mb_w, self.mb_h);
+        for (i, (st, c)) in self.mbs.iter().zip(col.mbs.iter_mut()).enumerate() {
+            if st.slice_num == u32::MAX {
+                continue;
+            }
+            let parity = ((i / self.mb_w) & 1) as u8;
+            c.intra = st.kind.is_intra();
+            c.field = st.field;
+            c.mv = st.mv;
+            c.ref_idx = st.ref_idx;
+            for l in 0..2 {
+                for b in 0..4 {
+                    let ri = st.ref_idx[l][b];
+                    c.ref_id[l][b] = if ri >= 0 { self.ref_id(st, parity, l, ri) } else { u32::MAX };
+                }
+            }
+        }
+        let col = Arc::new(col);
+        match self.structure.parity() {
+            Some(p) => self.frame.publish_col(p as usize, col),
+            None => {
+                self.frame.publish_col(0, col.clone());
+                self.frame.publish_col(1, col);
+            }
+        }
+    }
+}
+
+/// [`PicState::ref_id`] on the picture's slice data.
+pub fn ref_id_of(slices: &[SliceInfo], mbaff: bool, st: &MbState, mb_parity: u8, l: usize, ri: i8) -> u32 {
+    let Some(s) = slices.get(st.slice_num as usize) else { return u32::MAX };
+    if mbaff && st.field && ri >= 0 {
+        let Some(&id) = s.ref_ids[l].get(ri as usize >> 1) else { return u32::MAX };
+        return (id & !3) | (1 + (mb_parity ^ (ri as u8 & 1))) as u32;
+    }
+    s.ref_ids[l].get(ri.max(0) as usize).copied().unwrap_or(u32::MAX)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -142,6 +260,8 @@ struct Weights {
     /// Implicit weights (w0, w1) indexed by ref0 * n1 + ref1.
     implicit: Vec<(i32, i32)>,
     n1: usize,
+    /// MBAFF: implicit weights of top / bottom field macroblocks, indexed by ref0 * 2 * n1 + ref1.
+    implicit_fld: [Vec<(i32, i32)>; 2],
 }
 
 /// Current macroblock syntax (prediction part).
@@ -177,6 +297,14 @@ impl Scratch {
     }
 }
 
+/// vertMvScale of direct prediction (8.4.1.2.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VScale {
+    One,
+    FrmToFld,
+    FldToFrm,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Nb {
     pub avail: bool,
@@ -199,36 +327,68 @@ pub struct SliceDecoder<'a> {
     pub qp: i32,
     pub chroma_qp_offset: [i32; 2],
     // current macroblock
+    /// Index of the current macroblock in `pic.mbs` (its position in the picture's MB grid).
     pub mb_addr: usize,
+    /// CurrMbAddr: the macroblock address in decoding order (MBAFF: 2 * pair + bottom).
+    pub cur_addr: usize,
     pub mb_x: usize,
     pub mb_y: usize,
     /// Neighbouring macroblocks A (left), B (above), C (above right), D (above left) when available.
     pub nb: [Option<usize>; 4],
+    /// MBAFF: the second macroblock of a left pair whose frame / field coding differs from the
+    /// current macroblock's (it holds part of the left neighbouring column).
+    pub nb_left2: Option<usize>,
     pub mv_done: u16,
     pub cur: MbCur,
     pub s: Box<Scratch>,
     weights: Weights,
-    /// Temporal direct: DistScaleFactor per refIdxL0, and whether pic0 is long-term.
-    tdirect: Vec<(i32, bool)>,
+    /// Temporal direct: DistScaleFactor per refIdxL0, and whether pic0 is long-term: [frame list,
+    /// field list of a top / bottom field macroblock (MBAFF)].
+    tdirect: [Vec<(i32, bool)>; 3],
     /// CABAC: previous MB in decoding order had a non-zero mb_qp_delta.
     pub prev_qp_delta_nz: bool,
+    /// Interlaced stream (`frame_mbs_only_flag` 0).
+    pub interlaced: bool,
+    /// MBAFF frame.
+    pub mbaff: bool,
+    /// The current macroblock is a field macroblock (field picture, or a field pair of an MBAFF frame).
+    pub field_mb: bool,
+    /// Parity of the current field macroblock (0 = top).
+    pub parity: u8,
+    /// Sample addressing of the current macroblock: offset of the plane view (a field of an MBAFF
+    /// frame starts at line 0 or 1), its stride, and the macroblock origin inside the view.
+    pub lbase: usize,
+    pub lstride: usize,
+    pub lx0: usize,
+    pub ly0: usize,
+    pub cbase: usize,
+    pub cstride: usize,
+    pub cx0: usize,
+    pub cy0: usize,
+    /// Scans of the current macroblock (frame or field).
+    pub scan4: &'static [u8; 16],
+    pub scan8: &'static [u8; 64],
+    /// Motion data of the co-located picture (interlaced B slices): [top, bottom] parity.
+    col: [Option<Arc<ColPic>>; 2],
 }
 
 /// Interpolate a bw x bh luma block at (px, py) with motion vector `mv` from reference `f` into `y`,
-/// and the corresponding chroma blocks into `c` (stride `cs`).
+/// and the corresponding chroma blocks into `c` (stride `cs`). `cdy` is added to the vertical
+/// chroma vector (field prediction from the opposite parity, Table 8-9).
 #[allow(clippy::too_many_arguments)]
 #[inline]
-fn predict_block(f: &Frame, mv: [i16; 2], px: usize, py: usize, bw: usize, bh: usize, y: (&mut [u8], usize), c: [&mut [u8]; 2], cs: usize) {
+fn predict_block(f: &RefPic, mv: [i16; 2], px: usize, py: usize, bw: usize, bh: usize, y: (&mut [u8], usize), c: [&mut [u8]; 2], cs: usize, cdy: i32) {
     const LW: usize = 24;
     let mut win = [0u8; LW * 21];
     let ix = px as i32 + (mv[0] as i32 >> 2);
     let iy = py as i32 + (mv[1] as i32 >> 2);
     f.luma_window(ix - 2, iy - 2, bw + 5, bh + 5, &mut win, LW);
     inter::mc_luma_win(&win, LW, (mv[0] & 3) as u32, (mv[1] & 3) as u32, bw, bh, y.0, y.1);
+    let cmy = mv[1] as i32 + cdy;
     let cx = (px / 2) as i32 + (mv[0] as i32 >> 3);
-    let cy = (py / 2) as i32 + (mv[1] as i32 >> 3);
+    let cy = (py / 2) as i32 + (cmy >> 3);
     let (cw, ch) = (bw / 2, bh / 2);
-    let (fx, fy) = ((mv[0] & 7) as u32, (mv[1] & 7) as u32);
+    let (fx, fy) = ((mv[0] & 7) as u32, (cmy & 7) as u32);
     for (comp, out) in c.into_iter().enumerate() {
         let mut w = [0u8; 16 * 9];
         f.chroma_window(comp, cx, cy, cw + 1, ch + 1, &mut w, 16);
@@ -241,6 +401,17 @@ fn median(a: i16, b: i16, c: i16) -> i16 {
     a.max(b).min(a.min(b).max(c))
 }
 
+/// DistScaleFactor-style weights (8.4.1.2.3 / 8.4.2.3.1) of `cur` between `poc0` and `poc1`.
+fn dist_scale(cur: i32, poc0: i32, poc1: i32) -> Option<i32> {
+    let tb = (cur - poc0).clamp(-128, 127);
+    let td = (poc1 - poc0).clamp(-128, 127);
+    if td == 0 {
+        return None;
+    }
+    let tx = (16384 + (td / 2).abs()) / td;
+    Some(((tb * tx + 32) >> 6).clamp(-1024, 1023))
+}
+
 impl<'a> SliceDecoder<'a> {
     pub fn new(sh: &'a SliceHeader, pps: &'a Pps, sps: &'a Sps, pic: &'a mut PicState, refs: &'a [Vec<RefPic>; 2], ls: &'a LevelScale) -> Result<Self> {
         let slice_num = pic.slices.len() as u32;
@@ -251,22 +422,36 @@ impl<'a> SliceDecoder<'a> {
             beta_offset: sh.slice_beta_offset_div2 * 2,
             ref_ids: [refs[0].iter().map(|r| r.id()).collect(), refs[1].iter().map(|r| r.id()).collect()],
         });
-        let weights = Self::build_weights(sh, pps, refs, pic.poc);
-        let mut tdirect = Vec::new();
-        if sh.slice_type == SliceType::B && !sh.direct_spatial_mv_pred && !refs[1].is_empty() {
-            let poc1 = refs[1][0].poc();
-            for r0 in refs[0].iter() {
-                let tb = (pic.poc - r0.poc()).clamp(-128, 127);
-                let td = (poc1 - r0.poc()).clamp(-128, 127);
-                if td == 0 || r0.long_term {
-                    tdirect.push((256, true));
-                } else {
-                    let tx = (16384 + (td / 2).abs()) / td;
-                    tdirect.push((((tb * tx + 32) >> 6).clamp(-1024, 1023), false));
+        let mbaff = pic.mbaff;
+        let weights = Self::build_weights(sh, pps, refs, pic.poc, mbaff.then_some(pic.field_poc));
+        let mut tdirect = [Vec::new(), Vec::new(), Vec::new()];
+        let mut col = [None, None];
+        if sh.slice_type == SliceType::B && !refs[1].is_empty() {
+            if !sh.direct_spatial_mv_pred {
+                let t = |cur: i32, l0: &[RefPic], r1: &RefPic| -> Vec<(i32, bool)> {
+                    l0.iter()
+                        .map(|r0| if r0.long_term { (256, true) } else { dist_scale(cur, r0.poc(), r1.poc()).map_or((256, true), |d| (d, false)) })
+                        .collect()
+                };
+                tdirect[0] = t(pic.poc, &refs[0], &refs[1][0]);
+                if mbaff {
+                    for p in 0..2u8 {
+                        let l0: Vec<RefPic> = refs[0].iter().flat_map(|r| [r.field_of(p), r.field_of(p ^ 1)]).collect();
+                        tdirect[1 + p as usize] = t(pic.field_poc[p as usize], &l0, &refs[1][0].field_of(p));
+                    }
                 }
+            }
+            if pic.frame.interlaced {
+                let f = &refs[1][0].frame;
+                col = [f.col(0).cloned(), f.col(1).cloned()];
             }
         }
         let (mb_w, mb_h) = (pic.mb_w, pic.mb_h);
+        let interlaced = pic.frame.interlaced;
+        let field_pic = pic.structure.is_field();
+        let parity = pic.structure.parity().unwrap_or(0);
+        let (scan4, scan8) = if field_pic { (&FIELD4, &FIELD8) } else { (&ZIGZAG4, &ZIGZAG8) };
+        let (pw, cw) = (pic.planes.width, pic.planes.cwidth);
         Ok(SliceDecoder {
             sh,
             pps,
@@ -280,19 +465,38 @@ impl<'a> SliceDecoder<'a> {
             qp: sh.qp(pps),
             chroma_qp_offset,
             mb_addr: 0,
+            cur_addr: 0,
             mb_x: 0,
             mb_y: 0,
             nb: [None; 4],
+            nb_left2: None,
             mv_done: 0,
             cur: MbCur::default(),
             s: Scratch::new(),
             weights,
             tdirect,
             prev_qp_delta_nz: false,
+            interlaced,
+            mbaff,
+            field_mb: field_pic,
+            parity,
+            lbase: 0,
+            lstride: pw,
+            lx0: 0,
+            ly0: 0,
+            cbase: 0,
+            cstride: cw,
+            cx0: 0,
+            cy0: 0,
+            scan4,
+            scan8,
+            col,
         })
     }
 
-    fn build_weights(sh: &SliceHeader, pps: &Pps, refs: &[Vec<RefPic>; 2], cur_poc: i32) -> Weights {
+    /// `mbaff_field_poc`: for MBAFF frames, the field order counts of the current frame (implicit
+    /// weights of field macroblocks use field distances).
+    fn build_weights(sh: &SliceHeader, pps: &Pps, refs: &[Vec<RefPic>; 2], cur_poc: i32, mbaff_field_poc: Option<[i32; 2]>) -> Weights {
         let mut w = Weights {
             mode: WpMode::Default,
             luma_denom: 0,
@@ -301,6 +505,7 @@ impl<'a> SliceDecoder<'a> {
             chroma: [Vec::new(), Vec::new()],
             implicit: Vec::new(),
             n1: refs[1].len(),
+            implicit_fld: [Vec::new(), Vec::new()],
         };
         let explicit = (pps.weighted_pred && sh.slice_type.is_p()) || (pps.weighted_bipred_idc == 1 && sh.slice_type.is_b());
         if explicit {
@@ -315,18 +520,24 @@ impl<'a> SliceDecoder<'a> {
             }
         } else if pps.weighted_bipred_idc == 2 && sh.slice_type.is_b() {
             w.mode = WpMode::Implicit;
-            for r0 in refs[0].iter() {
-                for r1 in refs[1].iter() {
-                    let tb = (cur_poc - r0.poc()).clamp(-128, 127);
-                    let td = (r1.poc() - r0.poc()).clamp(-128, 127);
-                    let pair = if td == 0 || r0.long_term || r1.long_term {
-                        (32, 32)
-                    } else {
-                        let tx = (16384 + (td / 2).abs()) / td;
-                        let dsf = ((tb * tx + 32) >> 6).clamp(-1024, 1023);
-                        if (dsf >> 2) < -64 || (dsf >> 2) > 128 { (32, 32) } else { (64 - (dsf >> 2), dsf >> 2) }
-                    };
-                    w.implicit.push(pair);
+            let table = |cur: i32, l0: &[RefPic], l1: &[RefPic]| -> Vec<(i32, i32)> {
+                let mut out = Vec::with_capacity(l0.len() * l1.len());
+                for r0 in l0 {
+                    for r1 in l1 {
+                        let pair = match dist_scale(cur, r0.poc(), r1.poc()) {
+                            Some(dsf) if !r0.long_term && !r1.long_term && (-64..=128).contains(&(dsf >> 2)) => (64 - (dsf >> 2), dsf >> 2),
+                            _ => (32, 32),
+                        };
+                        out.push(pair);
+                    }
+                }
+                out
+            };
+            w.implicit = table(cur_poc, &refs[0], &refs[1]);
+            if let Some(fp) = mbaff_field_poc {
+                for p in 0..2u8 {
+                    let fl = |l: &[RefPic]| -> Vec<RefPic> { l.iter().flat_map(|r| [r.field_of(p), r.field_of(p ^ 1)]).collect() };
+                    w.implicit_fld[p as usize] = table(fp[p as usize], &fl(&refs[0]), &fl(&refs[1]));
                 }
             }
         }
@@ -337,9 +548,10 @@ impl<'a> SliceDecoder<'a> {
     // Neighbour helpers
     // ------------------------------------------------------------------------------------------
 
-    /// Set up the current macroblock address and neighbour availability.
+    /// Set up the current macroblock address and neighbour availability (non-MBAFF pictures).
     pub fn start_mb(&mut self, addr: usize) {
         self.mb_addr = addr;
+        self.cur_addr = addr;
         self.mb_x = addr % self.mb_w;
         self.mb_y = addr / self.mb_w;
         let sn = self.slice_num;
@@ -354,7 +566,33 @@ impl<'a> SliceDecoder<'a> {
             if y > 0 && x > 0 { ok(addr - w - 1) } else { None },
         ];
         self.mv_done = 0;
-        self.pic.mbs[addr] = MbState { slice_num: sn, ..MbState::default() };
+        self.lx0 = x * 16;
+        self.ly0 = y * 16;
+        self.cx0 = x * 8;
+        self.cy0 = y * 8;
+        let field = self.field_mb;
+        self.pic.mbs[addr] = MbState { slice_num: sn, field, ..MbState::default() };
+    }
+
+    /// Reference picture `ri` of list `l` for the current macroblock: MBAFF field macroblocks use
+    /// field lists (8.4.2.1): field `parity ^ (ri & 1)` of frame `ri / 2`.
+    #[inline]
+    pub fn ref_pic(&self, l: usize, ri: i8) -> Option<std::borrow::Cow<'a, RefPic>> {
+        if ri < 0 {
+            return None;
+        }
+        let refs: &'a [Vec<RefPic>; 2] = self.refs;
+        if self.mbaff && self.field_mb {
+            let r = refs[l].get(ri as usize >> 1)?;
+            return Some(std::borrow::Cow::Owned(r.field_of(self.parity ^ (ri as u8 & 1))));
+        }
+        refs[l].get(ri as usize).map(std::borrow::Cow::Borrowed)
+    }
+
+    /// Number of entries of list `l` for the current macroblock.
+    #[inline]
+    pub fn num_refs(&self, l: usize) -> usize {
+        if self.mbaff && self.field_mb { 2 * self.refs[l].len() } else { self.refs[l].len() }
     }
 
     #[inline]
@@ -368,9 +606,10 @@ impl<'a> SliceDecoder<'a> {
 
     /// Neighbour MB usable for intra prediction (constrained_intra_pred aware).
     fn intra_nb(&self, n: usize) -> bool {
+        let ok = |m: usize| !self.pps.constrained_intra_pred || self.pic.mbs[m].kind.is_intra();
         match self.nb[n] {
             None => false,
-            Some(a) => !self.pps.constrained_intra_pred || self.pic.mbs[a].kind.is_intra(),
+            Some(a) => ok(a) && (n != 0 || self.nb_left2.is_none_or(ok)),
         }
     }
 
@@ -382,8 +621,18 @@ impl<'a> SliceDecoder<'a> {
     fn nc_luma(&self, raster: usize) -> i32 {
         let (bx, by) = (raster & 3, raster >> 2);
         let cur = self.mb();
-        let a = if bx > 0 { Some(cur.nnz[raster - 1]) } else { self.nb[0].map(|m| self.pic.mbs[m].nnz[by * 4 + 3]) };
-        let b = if by > 0 { Some(cur.nnz[raster - 4]) } else { self.nb[1].map(|m| self.pic.mbs[m].nnz[12 + bx]) };
+        let (a, b) = if self.mbaff {
+            let nnz = |n: Option<(usize, usize)>| n.map(|(m, r)| self.pic.mbs[m].nnz[r]);
+            (
+                if bx > 0 { Some(cur.nnz[raster - 1]) } else { nnz(self.nb_blk4_mbaff(-1, by as i32)) },
+                if by > 0 { Some(cur.nnz[raster - 4]) } else { nnz(self.nb_blk4_mbaff(bx as i32, -1)) },
+            )
+        } else {
+            (
+                if bx > 0 { Some(cur.nnz[raster - 1]) } else { self.nb[0].map(|m| self.pic.mbs[m].nnz[by * 4 + 3]) },
+                if by > 0 { Some(cur.nnz[raster - 4]) } else { self.nb[1].map(|m| self.pic.mbs[m].nnz[12 + bx]) },
+            )
+        };
         match (a, b) {
             (Some(a), Some(b)) => (a as i32 + b as i32 + 1) >> 1,
             (Some(a), None) => a as i32,
@@ -395,8 +644,18 @@ impl<'a> SliceDecoder<'a> {
     fn nc_chroma(&self, c: usize, raster: usize) -> i32 {
         let (bx, by) = (raster & 1, raster >> 1);
         let cur = self.mb();
-        let a = if bx > 0 { Some(cur.nnz_c[c][raster - 1]) } else { self.nb[0].map(|m| self.pic.mbs[m].nnz_c[c][by * 2 + 1]) };
-        let b = if by > 0 { Some(cur.nnz_c[c][raster - 2]) } else { self.nb[1].map(|m| self.pic.mbs[m].nnz_c[c][2 + bx]) };
+        let (a, b) = if self.mbaff {
+            let nnz = |n: Option<(usize, usize)>| n.map(|(m, r)| self.pic.mbs[m].nnz_c[c][r]);
+            (
+                if bx > 0 { Some(cur.nnz_c[c][raster - 1]) } else { nnz(self.nb_chroma_blk_mbaff(-1, by as i32)) },
+                if by > 0 { Some(cur.nnz_c[c][raster - 2]) } else { nnz(self.nb_chroma_blk_mbaff(bx as i32, -1)) },
+            )
+        } else {
+            (
+                if bx > 0 { Some(cur.nnz_c[c][raster - 1]) } else { self.nb[0].map(|m| self.pic.mbs[m].nnz_c[c][by * 2 + 1]) },
+                if by > 0 { Some(cur.nnz_c[c][raster - 2]) } else { self.nb[1].map(|m| self.pic.mbs[m].nnz_c[c][2 + bx]) },
+            )
+        };
         match (a, b) {
             (Some(a), Some(b)) => (a as i32 + b as i32 + 1) >> 1,
             (Some(a), None) => a as i32,
@@ -407,6 +666,28 @@ impl<'a> SliceDecoder<'a> {
 
     /// Motion data of the neighbouring 4x4 block at (x, y) (4x4 units, relative to the current MB).
     pub(crate) fn nb_motion(&self, list: usize, x: i32, y: i32) -> Nb {
+        self.nb_motion_luma(list, if x < 0 { -1 } else { x * 4 }, if y < 0 { -1 } else { y * 4 })
+    }
+
+    /// Motion data of the neighbouring block covering luma location (xl, yl) relative to the
+    /// current MB (MBAFF frames map locations, not 4x4 blocks: 6.4.12.2).
+    pub(crate) fn nb_motion_luma(&self, list: usize, xl: i32, yl: i32) -> Nb {
+        let (x, y) = (xl >> 2, yl >> 2);
+        if self.mbaff && (xl < 0 || yl < 0 || xl > 15) {
+            if (x > 3 && y >= 0) || (x < 0 && y > 3) {
+                return NB_NA;
+            }
+            let Some((m, xw, yw)) = self.nb_loc_mbaff(xl, yl, 16, 16) else { return NB_NA };
+            let r = ((yw >> 2) * 4 + (xw >> 2)) as usize;
+            let st = &self.pic.mbs[m];
+            let b8 = (r >> 3) * 2 + ((r & 3) >> 1);
+            let ri = st.ref_idx[list][b8];
+            if ri < 0 {
+                return Nb { avail: true, ref_idx: -1, mv: [0, 0] };
+            }
+            let (ri, mv) = self.mbaff_scale(st, ri, st.mv[list][r]);
+            return Nb { avail: true, ref_idx: ri, mv };
+        }
         let (mb, bx, by) = if x < 0 {
             if y < 0 {
                 (self.nb[3], 3, 3)
@@ -439,12 +720,13 @@ impl<'a> SliceDecoder<'a> {
     /// Returns (A, B, C) neighbour motion for a partition at (x, y) of width w (4x4 units), with C
     /// replaced by D when unavailable.
     fn nb_abc(&self, list: usize, x: usize, y: usize, w: usize) -> (Nb, Nb, Nb) {
-        let (x, y, w) = (x as i32, y as i32, w as i32);
-        let a = self.nb_motion(list, x - 1, y);
-        let b = self.nb_motion(list, x, y - 1);
-        let mut c = self.nb_motion(list, x + w, y - 1);
+        // luma locations of A, B, C, D (6.4.11.7)
+        let (x, y, w) = (x as i32 * 4, y as i32 * 4, w as i32 * 4);
+        let a = self.nb_motion_luma(list, x - 1, y);
+        let b = self.nb_motion_luma(list, x, y - 1);
+        let mut c = self.nb_motion_luma(list, x + w, y - 1);
         if !c.avail {
-            c = self.nb_motion(list, x - 1, y - 1);
+            c = self.nb_motion_luma(list, x - 1, y - 1);
         }
         (a, b, c)
     }
@@ -513,26 +795,105 @@ impl<'a> SliceDecoder<'a> {
     // Direct prediction (8.4.1.2)
     // ------------------------------------------------------------------------------------------
 
-    /// Co-located (mvCol, refIdxCol, referenced picture id) for 4x4 block `raster` of the current MB.
-    fn colocated(&self, raster: usize) -> ([i16; 2], i8, u32) {
-        let Some(col) = self.refs[1].first() else { return ([0, 0], -1, u32::MAX) };
+    /// Co-located (mvCol, refIdxCol, referenced picture id, vertMvScale) for 4x4 block `raster` of
+    /// the current MB (8.4.1.2.1).
+    fn colocated(&self, raster: usize) -> ([i16; 2], i8, u32, VScale) {
+        const NONE: ([i16; 2], i8, u32, VScale) = ([0, 0], -1, u32::MAX, VScale::One);
+        let Some(col) = self.refs[1].first() else { return NONE };
+        if self.interlaced {
+            return self.colocated_interlaced(col, raster);
+        }
         let raster = if self.sps.direct_8x8_inference {
             let (bx, by) = (raster & 3, raster >> 2);
             (if by >= 2 { 12 } else { 0 }) + if bx >= 2 { 3 } else { 0 }
         } else {
             raster
         };
-        if col.frame.mb_w != self.mb_w || self.mb_y >= col.frame.mb_h() {
-            return ([0, 0], -1, u32::MAX);
+        if col.frame.mb_w != self.mb_w || self.mb_y >= col.frame.mb_h() || col.frame.interlaced {
+            return NONE;
         }
         let m = col.frame.row(self.mb_y);
         let mb = self.mb_x;
         if m.intra[mb] {
-            return ([0, 0], -1, u32::MAX);
+            return NONE;
         }
         let b8 = mb * 4 + (raster >> 3) * 2 + ((raster & 3) >> 1);
         let l = if m.ref_idx[0][b8] >= 0 { 0 } else { 1 };
-        (m.mv[l][mb * 16 + raster], m.ref_idx[l][b8], m.ref_id[l][b8])
+        (m.mv[l][mb * 16 + raster], m.ref_idx[l][b8], m.ref_id[l][b8], VScale::One)
+    }
+
+    /// [`Self::colocated`] for interlaced streams: Tables 8-6 and 8-8.
+    fn colocated_interlaced(&self, r1: &RefPic, raster: usize) -> ([i16; 2], i8, u32, VScale) {
+        const NONE: ([i16; 2], i8, u32, VScale) = ([0, 0], -1, u32::MAX, VScale::One);
+        let (bx, by) = (raster & 3, raster >> 2);
+        let (x_col, y_col) = if self.sps.direct_8x8_inference { (if bx >= 2 { 12 } else { 0 }, if by >= 2 { 12 } else { 0 }) } else { (bx * 4, by * 4) };
+        // which field of RefPicList1[0] (frame decoding of a complementary field pair)
+        let top_abs = (r1.field_poc[0] - self.pic.poc).abs();
+        let bottom_abs = (r1.field_poc[1] - self.pic.poc).abs();
+        let poc_parity = if top_abs < bottom_abs { 0 } else { 1 };
+        let field_pic = self.pic.structure.is_field();
+        let colpic = if field_pic {
+            self.col[r1.structure.parity().unwrap_or(0) as usize & 1].as_ref()
+        } else {
+            match self.col[0].as_ref() {
+                Some(c) if c.kind == ColKind::Fld => {
+                    let p = if self.field_mb { self.parity } else { poc_parity };
+                    self.col[p as usize].as_ref()
+                }
+                c => c,
+            }
+        };
+        let Some(colpic) = colpic else { return NONE };
+        let (mx, my) = (self.mb_x, self.mb_y);
+        let frm_to_fld = |y: usize| (y, (2 * y_col) % 16, VScale::FrmToFld);
+        let (cy, ym, scale) = if field_pic {
+            match colpic.kind {
+                ColKind::Fld => (my, y_col, VScale::One),
+                ColKind::Frm => frm_to_fld(2 * my + y_col / 8),
+                ColKind::Afrm => {
+                    if colpic.mb(mx, 2 * my).field {
+                        (2 * my + self.parity as usize, y_col, VScale::One)
+                    } else {
+                        frm_to_fld(2 * my + y_col / 8)
+                    }
+                }
+            }
+        } else if !self.mbaff {
+            match colpic.kind {
+                ColKind::Fld => (my / 2, 8 * (my % 2) + 4 * (y_col / 8), VScale::FldToFrm),
+                _ => (my, y_col, VScale::One),
+            }
+        } else {
+            let (py, bottom) = (my / 2, my % 2);
+            match colpic.kind {
+                ColKind::Fld => {
+                    if self.field_mb {
+                        (py, y_col, VScale::One)
+                    } else {
+                        (py, 8 * bottom + 4 * (y_col / 8), VScale::FldToFrm)
+                    }
+                }
+                _ => {
+                    let x_field = colpic.mb(mx, my).field;
+                    match (self.field_mb, x_field) {
+                        (false, false) | (true, true) => (my, y_col, VScale::One),
+                        (false, true) => (2 * py + poc_parity as usize, 8 * bottom + 4 * (y_col / 8), VScale::FldToFrm),
+                        (true, false) => frm_to_fld(2 * py + y_col / 8),
+                    }
+                }
+            }
+        };
+        if colpic.mb_w != self.mb_w || cy >= colpic.mb_h {
+            return NONE;
+        }
+        let c = colpic.mb(mx, cy);
+        if c.intra {
+            return NONE;
+        }
+        let r = (ym / 4) * 4 + x_col / 4;
+        let b8 = (ym / 8) * 2 + x_col / 8;
+        let l = if c.ref_idx[0][b8] >= 0 { 0 } else { 1 };
+        (c.mv[l][r], c.ref_idx[l][b8], c.ref_id[l][b8], scale)
     }
 
     /// Spatial direct: MB-level reference indices, predicted mvs and directZeroPrediction (8.4.1.2.2).
@@ -571,7 +932,7 @@ impl<'a> SliceDecoder<'a> {
             for sub in (0..4).filter(|s| unit == 1 || *s == 0) {
                 let (x, y) = (x8 + (sub & 1), y8 + (sub >> 1));
                 let raster = y * 4 + x;
-                let (mv_col, ref_col, id_col) = self.colocated(raster);
+                let (mv_col, ref_col, id_col, scale) = self.colocated(raster);
                 let (refs, mvs) = if spatial {
                     let col_zero = col_short_term && ref_col == 0 && (-1..=1).contains(&mv_col[0]) && (-1..=1).contains(&mv_col[1]);
                     let mut mvs = base_mvs;
@@ -582,15 +943,20 @@ impl<'a> SliceDecoder<'a> {
                     }
                     (base_refs, mvs)
                 } else {
+                    // 8.4.1.2.3: the picture refIdxCol referred to, as seen from the current
+                    // picture / macroblock, and the vertical vector scaled to its structure
+                    let (target, mv_col) = match scale {
+                        VScale::One => (id_col, mv_col),
+                        VScale::FrmToFld => ((id_col & !3) | (1 + self.parity as u32), [mv_col[0], mv_col[1] / 2]),
+                        VScale::FldToFrm => (id_col & !3, [mv_col[0], mv_col[1].wrapping_mul(2)]),
+                    };
                     let ref0 = if ref_col < 0 {
                         0
                     } else {
-                        match self.refs[0].iter().position(|r| r.id() == id_col) {
-                            Some(i) => i as i8,
-                            None => 0,
-                        }
+                        (0..self.num_refs(0)).find(|&i| self.ref_pic(0, i as i8).is_some_and(|r| r.id() == target)).unwrap_or(0) as i8
                     };
-                    let (dsf, ltr) = self.tdirect.get(ref0 as usize).copied().unwrap_or((256, true));
+                    let t = if self.mbaff && self.field_mb { 1 + self.parity as usize } else { 0 };
+                    let (dsf, ltr) = self.tdirect[t].get(ref0 as usize).copied().unwrap_or((256, true));
                     let (mv0, mv1) = if ltr {
                         (mv_col, [0, 0])
                     } else {
@@ -630,7 +996,7 @@ impl<'a> SliceDecoder<'a> {
         if info.kind == MbKind::BDirect16x16 || info.kind == MbKind::BSkip {
             return self.derive_direct(0xf);
         }
-        let n = [self.refs[0].len(), self.refs[1].len()];
+        let n = [self.num_refs(0), self.num_refs(1)];
         if info.part != Part::P8x8 {
             let shape = match info.part {
                 Part::P16x8 => 1,
@@ -697,18 +1063,20 @@ impl<'a> SliceDecoder<'a> {
             WpMode::Default => Weight::Default,
             WpMode::Implicit => {
                 if refs[0] >= 0 && refs[1] >= 0 {
-                    let (w0, w1) = w.implicit[refs[0] as usize * w.n1 + refs[1] as usize];
+                    let (table, n1) = if self.mbaff && self.field_mb { (&w.implicit_fld[self.parity as usize & 1], 2 * w.n1) } else { (&w.implicit, w.n1) };
+                    let (w0, w1) = table.get(refs[0] as usize * n1 + refs[1] as usize).copied().unwrap_or((32, 32));
                     Weight::Weighted { log_wd: 5, w0, w1, o0: 0, o1: 0 }
                 } else {
                     Weight::Default
                 }
             }
             WpMode::Explicit => {
+                let shift = (self.mbaff && self.field_mb) as usize;
                 let get = |l: usize| -> (i32, i32) {
                     if refs[l] < 0 {
                         return (0, 0);
                     }
-                    let r = refs[l] as usize;
+                    let r = refs[l] as usize >> shift;
                     if comp == 0 {
                         w.luma[l].get(r).copied().unwrap_or((1 << w.luma_denom, 0))
                     } else {
@@ -723,6 +1091,15 @@ impl<'a> SliceDecoder<'a> {
         }
     }
 
+    /// Vertical chroma vector offset for prediction from field `rp` (Table 8-9).
+    #[inline]
+    fn chroma_dy(&self, rp: &RefPic) -> i32 {
+        match rp.structure.parity() {
+            Some(p) if self.field_mb => 2 * (self.parity as i32 - p as i32),
+            _ => 0,
+        }
+    }
+
     /// Motion-compensated prediction of a rectangle (4x4 units) written into the picture.
     fn mc_rect(&mut self, x4: usize, y4: usize, w4: usize, h4: usize) {
         let st = &self.pic.mbs[self.mb_addr];
@@ -732,32 +1109,34 @@ impl<'a> SliceDecoder<'a> {
         let mvs = [st.mv[0][r], st.mv[1][r]];
         let (bw, bh) = (w4 * 4, h4 * 4);
         let wts = [self.weight_for(refs, 0), self.weight_for(refs, 1), self.weight_for(refs, 2)];
-        let px = self.mb_x * 16 + x4 * 4;
-        let py = self.mb_y * 16 + y4 * 4;
-        let use0 = refs[0] >= 0 && self.refs[0].get(refs[0] as usize).is_some();
-        let use1 = refs[1] >= 0 && self.refs[1].get(refs[1] as usize).is_some();
-        let ys = self.pic.planes.width;
-        let cs = self.pic.planes.cwidth;
-        let (cx, cy) = (px / 2, py / 2);
+        let px = self.lx0 + x4 * 4;
+        let py = self.ly0 + y4 * 4;
+        let rp = [self.ref_pic(0, refs[0]), self.ref_pic(1, refs[1])];
+        let use0 = rp[0].is_some();
+        let use1 = rp[1].is_some();
+        let ys = self.lstride;
+        let cs = self.cstride;
+        let (cx, cy) = (self.cx0 + x4 * 2, self.cy0 + y4 * 2);
+        let yo = self.lbase + py * ys + px;
+        let co = self.cbase + cy * cs + cx;
         if use0 != use1 && wts.iter().all(|w| *w == Weight::Default) {
             // single-list unweighted prediction: interpolate straight into the picture
             let l = if use0 { 0 } else { 1 };
-            let f = &self.refs[l][refs[l] as usize].frame;
+            let Some(f) = rp[l].as_deref() else { return };
+            let cdy = self.chroma_dy(f);
             let planes = &mut self.pic.planes;
-            predict_block(f, mvs[l], px, py, bw, bh, (&mut planes.y[py * ys + px..], ys), [&mut planes.cb[cy * cs + cx..], &mut planes.cr[cy * cs + cx..]], cs);
+            predict_block(f, mvs[l], px, py, bw, bh, (&mut planes.y[yo..], ys), [&mut planes.cb[co..], &mut planes.cr[co..]], cs, cdy);
             return;
         }
+        let cdy = [rp[0].as_deref().map_or(0, |f| self.chroma_dy(f)), rp[1].as_deref().map_or(0, |f| self.chroma_dy(f))];
         let s = &mut *self.s;
         for l in 0..2 {
-            if refs[l] < 0 {
-                continue;
-            }
-            let Some(rp) = self.refs[l].get(refs[l] as usize) else { continue };
+            let Some(f) = rp[l].as_deref() else { continue };
             let [pc0, pc1] = &mut s.pred_c[l];
-            predict_block(&rp.frame, mvs[l], px, py, bw, bh, (&mut s.pred[l][..], 16), [&mut pc0[..], &mut pc1[..]], 8);
+            predict_block(f, mvs[l], px, py, bw, bh, (&mut s.pred[l][..], 16), [&mut pc0[..], &mut pc1[..]], 8, cdy[l]);
         }
         inter::weighted_store(
-            &mut self.pic.planes.y[py * ys + px..],
+            &mut self.pic.planes.y[yo..],
             ys,
             if use0 { Some(&s.pred[0][..]) } else { None },
             if use1 { Some(&s.pred[1][..]) } else { None },
@@ -771,7 +1150,7 @@ impl<'a> SliceDecoder<'a> {
             let a = if use0 { Some(&s.pred_c[0][c][..]) } else { None };
             let b = if use1 { Some(&s.pred_c[1][c][..]) } else { None };
             let plane = if c == 0 { &mut self.pic.planes.cb } else { &mut self.pic.planes.cr };
-            inter::weighted_store(&mut plane[cy * cs + cx..], cs, a, b, 8, bw / 2, bh / 2, wc);
+            inter::weighted_store(&mut plane[co..], cs, a, b, 8, bw / 2, bh / 2, wc);
         }
     }
 
@@ -843,6 +1222,33 @@ impl<'a> SliceDecoder<'a> {
         })
     }
 
+    /// [`Self::intra_mode_nb`] for MBAFF frames: the block covering neighbouring luma location
+    /// (xn, yn); an Intra_8x8 block next to Intra_4x4 blocks uses block n8 * 4 + 1 (A) / + 2 (B).
+    fn intra_mode_mbaff(&self, xn: i32, yn: i32, cur8x8: bool, is_a: bool, b8: usize) -> Option<u8> {
+        let (m, xw, yw) = self.nb_loc_mbaff(xn, yn, 16, 16)?;
+        let st = &self.pic.mbs[m];
+        if self.pps.constrained_intra_pred && !st.kind.is_intra() {
+            return None;
+        }
+        let (xw, yw) = (xw as usize, yw as usize);
+        Some(match st.kind {
+            MbKind::I4x4 if cur8x8 => {
+                let n8 = (yw / 8) * 2 + xw / 8;
+                // 8.3.2.1: block n8 * 4 + n, n = 1 for A (3 for the lower left 8x8 block of a
+                // frame macroblock next to a field pair), 2 for B
+                let n = match (is_a, !self.field_mb && st.field && b8 == 2) {
+                    (true, true) => 3,
+                    (true, false) => 1,
+                    (false, _) => 2,
+                };
+                let (bx, by) = BLK4_XY[n8 * 4 + n];
+                st.intra_modes[by as usize * 4 + bx as usize]
+            }
+            MbKind::I4x4 | MbKind::I8x8 => st.intra_modes[(yw / 4) * 4 + xw / 4],
+            _ => 2,
+        })
+    }
+
     /// Resolve Intra4x4PredMode / Intra8x8PredMode for the current MB from `self.cur.rem_mode`.
     pub fn derive_intra_modes(&mut self, is8x8: bool) {
         let step = if is8x8 { 2 } else { 1 };
@@ -854,8 +1260,20 @@ impl<'a> SliceDecoder<'a> {
                 let (x, y) = BLK4_XY[i];
                 (x as usize, y as usize)
             };
-            let a = if bx > 0 { Some(self.mb().intra_modes[by * 4 + bx - 1]) } else { self.intra_mode_nb(0, 3, by) };
-            let b = if by > 0 { Some(self.mb().intra_modes[(by - 1) * 4 + bx]) } else { self.intra_mode_nb(1, bx, 3) };
+            let a = if bx > 0 {
+                Some(self.mb().intra_modes[by * 4 + bx - 1])
+            } else if self.mbaff {
+                self.intra_mode_mbaff(-1, by as i32 * 4, is8x8, true, i)
+            } else {
+                self.intra_mode_nb(0, 3, by)
+            };
+            let b = if by > 0 {
+                Some(self.mb().intra_modes[(by - 1) * 4 + bx])
+            } else if self.mbaff {
+                self.intra_mode_mbaff(bx as i32 * 4, -1, is8x8, false, i)
+            } else {
+                self.intra_mode_nb(1, bx, 3)
+            };
             let pred = match (a, b) {
                 (Some(a), Some(b)) => a.min(b),
                 _ => 2,
@@ -885,13 +1303,12 @@ impl<'a> SliceDecoder<'a> {
         if self.s.blk_nz & (1 << raster) == 0 {
             return;
         }
-        let stride = self.pic.planes.width;
-        let px = self.mb_x * 16 + (raster & 3) * 4;
-        let py = self.mb_y * 16 + (raster >> 2) * 4;
+        let stride = self.lstride;
+        let o = self.lbase + (self.ly0 + (raster >> 2) * 4) * stride + self.lx0 + (raster & 3) * 4;
         let Some(blk) = self.s.coef.get_mut(raster * 16..).and_then(|c| c.first_chunk_mut::<16>()) else {
             return;
         };
-        transform::idct4_add(blk, &mut self.pic.planes.y[py * stride + px..], stride);
+        transform::idct4_add(blk, &mut self.pic.planes.y[o..], stride);
         blk.fill(0);
     }
 
@@ -899,18 +1316,17 @@ impl<'a> SliceDecoder<'a> {
         if self.s.blk_nz & (1 << b8) == 0 {
             return;
         }
-        let stride = self.pic.planes.width;
-        let px = self.mb_x * 16 + (b8 & 1) * 8;
-        let py = self.mb_y * 16 + (b8 >> 1) * 8;
+        let stride = self.lstride;
+        let o = self.lbase + (self.ly0 + (b8 >> 1) * 8) * stride + self.lx0 + (b8 & 1) * 8;
         let Some(blk) = self.s.coef.get_mut(b8 * 64..).and_then(|c| c.first_chunk_mut::<64>()) else {
             return;
         };
-        transform::idct8_add(blk, &mut self.pic.planes.y[py * stride + px..], stride);
+        transform::idct8_add(blk, &mut self.pic.planes.y[o..], stride);
         blk.fill(0);
     }
 
     fn add_chroma(&mut self) {
-        let stride = self.pic.planes.cwidth;
+        let stride = self.cstride;
         for c in 0..2 {
             if self.s.c_nz[c] == 0 {
                 continue;
@@ -919,21 +1335,30 @@ impl<'a> SliceDecoder<'a> {
                 if self.s.c_nz[c] & (1 << b) == 0 {
                     continue;
                 }
-                let px = self.mb_x * 8 + (b & 1) * 4;
-                let py = self.mb_y * 8 + (b >> 1) * 4;
+                let o = self.cbase + (self.cy0 + (b >> 1) * 4) * stride + self.cx0 + (b & 1) * 4;
                 let Some(blk) = self.s.coef_c[c].get_mut(b * 16..).and_then(|c| c.first_chunk_mut::<16>()) else {
                     continue;
                 };
                 let plane = if c == 0 { &mut self.pic.planes.cb } else { &mut self.pic.planes.cr };
-                transform::idct4_add(blk, &mut plane[py * stride + px..], stride);
+                transform::idct4_add(blk, &mut plane[o..], stride);
                 blk.fill(0);
             }
             self.s.c_nz[c] = 0;
         }
     }
 
-    fn luma_avail4(&self, bx: usize, by: usize) -> Avail {
-        let a = self.intra_nb(0);
+    /// MBAFF: the left neighbouring samples of rows y0..y0 + n all lie in macroblocks usable
+    /// for intra prediction (a left pair of the other frame / field kind supplies the rows from
+    /// both of its macroblocks).
+    fn left_rows_intra(&self, y0: i32, n: i32) -> bool {
+        let ok = |m: usize| !self.pps.constrained_intra_pred || self.pic.mbs[m].kind.is_intra();
+        (y0..y0 + n).all(|y| self.nb_loc_mbaff(-1, y, 16, 16).is_some_and(|(m, _, _)| ok(m)))
+    }
+
+    /// Sample availability of the `n` x `n` luma block at 4x4 position (bx, by).
+    fn luma_avail4(&self, bx: usize, by: usize, n: usize) -> Avail {
+        let mixed_left = self.mbaff && bx == 0 && self.nb_left2.is_some();
+        let a = if mixed_left { self.left_rows_intra(by as i32 * 4, n as i32) } else { self.intra_nb(0) };
         let b = self.intra_nb(1);
         let c = self.intra_nb(2);
         let d = self.intra_nb(3);
@@ -941,6 +1366,7 @@ impl<'a> SliceDecoder<'a> {
         let top = if by > 0 { true } else { b };
         let top_left = match (bx > 0, by > 0) {
             (true, true) => true,
+            (false, true) if mixed_left => self.left_rows_intra(by as i32 * 4 - 1, 1),
             (false, true) => a,
             (true, false) => b,
             (false, false) => d,
@@ -958,23 +1384,24 @@ impl<'a> SliceDecoder<'a> {
     /// Reconstruct an intra MB (prediction + residual) after its syntax has been parsed.
     pub fn reconstruct_intra(&mut self) {
         let kind = self.mb().kind;
-        let stride = self.pic.planes.width;
-        let (x0, y0) = (self.mb_x * 16, self.mb_y * 16);
+        let stride = self.lstride;
+        let (x0, y0) = (self.lx0, self.ly0);
+        let lb = self.lbase;
         match kind {
             MbKind::I4x4 => {
                 for (blk, &(bx, by)) in BLK4_XY.iter().enumerate() {
                     let (bx, by) = (bx as usize, by as usize);
                     let _ = blk;
-                    let av = self.luma_avail4(bx, by);
+                    let av = self.luma_avail4(bx, by, 4);
                     let mode = self.mb().intra_modes[by * 4 + bx];
-                    intra::pred4x4(&mut self.pic.planes.y, stride, x0 + bx * 4, y0 + by * 4, mode, av);
+                    intra::pred4x4(&mut self.pic.planes.y[lb..], stride, x0 + bx * 4, y0 + by * 4, mode, av);
                     self.add_luma_block4(by * 4 + bx);
                 }
             }
             MbKind::I8x8 => {
                 for b8 in 0..4 {
                     let (bx, by) = ((b8 & 1) * 2, (b8 >> 1) * 2);
-                    let mut av = self.luma_avail4(bx, by);
+                    let mut av = self.luma_avail4(bx, by, 8);
                     av.top_right = match b8 {
                         0 => self.intra_nb(1),
                         1 => self.intra_nb(2),
@@ -982,13 +1409,13 @@ impl<'a> SliceDecoder<'a> {
                         _ => false,
                     };
                     let mode = self.mb().intra_modes[by * 4 + bx];
-                    intra::pred8x8(&mut self.pic.planes.y, stride, x0 + bx * 4, y0 + by * 4, mode, av);
+                    intra::pred8x8(&mut self.pic.planes.y[lb..], stride, x0 + bx * 4, y0 + by * 4, mode, av);
                     self.add_luma_block8(b8);
                 }
             }
             MbKind::I16x16 => {
                 let av = Avail { left: self.intra_nb(0), top: self.intra_nb(1), top_left: self.intra_nb(3), top_right: false };
-                intra::pred16x16(&mut self.pic.planes.y, stride, x0, y0, self.cur.info.i16_mode, av);
+                intra::pred16x16(&mut self.pic.planes.y[lb..], stride, x0, y0, self.cur.info.i16_mode, av);
                 for r in 0..16 {
                     self.add_luma_block4(r);
                 }
@@ -996,11 +1423,18 @@ impl<'a> SliceDecoder<'a> {
             _ => {}
         }
         let av = Avail { left: self.intra_nb(0), top: self.intra_nb(1), top_left: self.intra_nb(3), top_right: false };
-        let cs = self.pic.planes.cwidth;
+        let cs = self.cstride;
         let mode = self.mb().intra_chroma_mode;
-        let (cx, cy) = (self.mb_x * 8, self.mb_y * 8);
-        intra::pred_chroma(&mut self.pic.planes.cb, cs, cx, cy, mode, av);
-        intra::pred_chroma(&mut self.pic.planes.cr, cs, cx, cy, mode, av);
+        let (cx, cy, cb) = (self.cx0, self.cy0, self.cbase);
+        let halves = if self.mbaff && self.nb_left2.is_some() {
+            let ok = |m: usize| !self.pps.constrained_intra_pred || self.pic.mbs[m].kind.is_intra();
+            let half = |y0: i32| (y0..y0 + 4).all(|y| self.nb_loc_mbaff(-1, y, 8, 8).is_some_and(|(m, _, _)| ok(m)));
+            [half(0), half(4)]
+        } else {
+            [av.left; 2]
+        };
+        intra::pred_chroma_halves(&mut self.pic.planes.cb[cb..], cs, cx, cy, mode, av, halves);
+        intra::pred_chroma_halves(&mut self.pic.planes.cr[cb..], cs, cx, cy, mode, av, halves);
         self.add_chroma();
         self.s.blk_nz = 0;
     }
@@ -1022,18 +1456,18 @@ impl<'a> SliceDecoder<'a> {
 
     /// Write I_PCM samples.
     pub fn write_pcm(&mut self, samples: &[u8]) {
-        let stride = self.pic.planes.width;
-        let (x0, y0) = (self.mb_x * 16, self.mb_y * 16);
+        let stride = self.lstride;
+        let o = self.lbase + self.ly0 * stride + self.lx0;
         for r in 0..16 {
-            self.pic.planes.y[(y0 + r) * stride + x0..(y0 + r) * stride + x0 + 16].copy_from_slice(&samples[r * 16..r * 16 + 16]);
+            self.pic.planes.y[o + r * stride..o + r * stride + 16].copy_from_slice(&samples[r * 16..r * 16 + 16]);
         }
-        let cs = self.pic.planes.cwidth;
-        let (cx, cy) = (self.mb_x * 8, self.mb_y * 8);
+        let cs = self.cstride;
+        let co = self.cbase + self.cy0 * cs + self.cx0;
         for c in 0..2 {
             let src = &samples[256 + c * 64..256 + c * 64 + 64];
             let plane = if c == 0 { &mut self.pic.planes.cb } else { &mut self.pic.planes.cr };
             for r in 0..8 {
-                plane[(cy + r) * cs + cx..(cy + r) * cs + cx + 8].copy_from_slice(&src[r * 8..r * 8 + 8]);
+                plane[co + r * cs..co + r * cs + 8].copy_from_slice(&src[r * 8..r * 8 + 8]);
             }
         }
     }
@@ -1084,7 +1518,7 @@ impl<'a> SliceDecoder<'a> {
         let mut any = false;
         for (k, &lv) in levels.iter().enumerate().skip(ac_only as usize) {
             if lv != 0 {
-                let p = ZIGZAG4[k] as usize;
+                let p = self.scan4[k] as usize;
                 blk[p] = transform::scale4(lv, ls[p], qp);
                 any = true;
             }
@@ -1104,7 +1538,7 @@ impl<'a> SliceDecoder<'a> {
         let mut any = false;
         for (k, &lv) in levels.iter().enumerate() {
             if lv != 0 {
-                let p = ZIGZAG8[k] as usize;
+                let p = self.scan8[k] as usize;
                 blk[p] = transform::scale8(lv, ls[p], qp);
                 any = true;
             }
@@ -1121,7 +1555,7 @@ impl<'a> SliceDecoder<'a> {
     pub fn put_luma_dc(&mut self, levels: &[i32; 16]) {
         let mut c = [0i32; 16];
         for (k, &lv) in levels.iter().enumerate() {
-            c[ZIGZAG4[k] as usize] = lv;
+            c[self.scan4[k] as usize] = lv;
         }
         let qp = self.qp;
         let ls00 = self.ls.ls4[0][(qp % 6) as usize][0];
@@ -1158,7 +1592,7 @@ impl<'a> SliceDecoder<'a> {
         let mut any = false;
         for (k, &lv) in levels.iter().enumerate().skip(1) {
             if lv != 0 {
-                let p = ZIGZAG4[k] as usize;
+                let p = self.scan4[k] as usize;
                 blk[p] = transform::scale4(lv, ls[p], qpc);
                 any = true;
             }
@@ -1238,7 +1672,9 @@ impl<'a> SliceDecoder<'a> {
         }
         self.mb_mut().kind = info.kind;
         self.mb_mut().transform_8x8 = transform_8x8;
-        let n_ref = [self.sh.num_ref_idx_active[0], self.sh.num_ref_idx_active[1]];
+        // field macroblocks of MBAFF frames index field lists of twice the length (7.4.5.1)
+        let fm = if self.mbaff && self.field_mb { 2 } else { 1 };
+        let n_ref = [self.sh.num_ref_idx_active[0] * fm, self.sh.num_ref_idx_active[1] * fm];
         match info.kind {
             MbKind::I4x4 | MbKind::I8x8 => {
                 let n = if info.kind == MbKind::I8x8 { 4 } else { 16 };
@@ -1418,6 +1854,9 @@ impl<'a> SliceDecoder<'a> {
 
     /// Decode slice_data() with CAVLC. `r` is positioned after the slice header.
     pub fn decode_cavlc(&mut self, r: &mut BitReader) -> Result<()> {
+        if self.mbaff {
+            return self.decode_cavlc_mbaff(r);
+        }
         let total = self.mb_w * self.mb_h;
         let mut addr = self.sh.first_mb_in_slice as usize;
         let intra_slice = self.sh.slice_type.is_intra();

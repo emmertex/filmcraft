@@ -9,7 +9,7 @@ use crate::mbinfo::{MbInfo, MbKind, Mv, Part};
 use crate::nal::{SliceHeader, SliceType, nal};
 use crate::picture::{CHROMA_PAD, Frame, LUMA_PAD, RefPic, avg_into};
 use crate::syntax::{MbCode, NbCtx};
-use crate::tables::{BLK4_XY, NUM_CTX, RASTER_TO_BLK4, ZIGZAG4, ZIGZAG8, chroma_qp};
+use crate::tables::{BLK4_XY, FIELD4, FIELD8, NUM_CTX, RASTER_TO_BLK4, ZIGZAG4, ZIGZAG8, chroma_qp};
 use crate::transform::{
     Deadzone, QuantTables, dequant_chroma_dc, dequant_luma_dc, dequant4, dequant8, fdct4, fdct8, idct4, idct8, quant_chroma_dc, quant_luma_dc, quant4, quant8,
 };
@@ -39,6 +39,20 @@ pub struct EncParams {
     pub always_intra: bool,
     /// Maximum CAVLC level magnitude (Baseline).
     pub cavlc_clamp: bool,
+    /// Field picture coding of this parity ([`crate::EncoderConfig::field_parity`]).
+    pub field: Option<u8>,
+}
+
+impl EncParams {
+    /// Coefficient scans: frame zig-zag, or field scans for field pictures.
+    #[inline]
+    pub fn scan4(&self) -> &'static [usize; 16] {
+        if self.field.is_some() { &FIELD4 } else { &ZIGZAG4 }
+    }
+    #[inline]
+    pub fn scan8(&self) -> &'static [usize; 64] {
+        if self.field.is_some() { &FIELD8 } else { &ZIGZAG8 }
+    }
 }
 
 /// Per-frame shared encoding state.
@@ -479,7 +493,7 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
         let av = self.avail(mx, my);
         let left = if av.left { Some(&self.mbs[idx - 1]) } else { None };
         let top = if av.top { Some(&self.mbs[idx - self.f.p.mbw]) } else { None };
-        let nb = NbCtx { left, top, cur: &self.mbs[idx], slice_type: self.f.st, prev_dqp_nz, t8x8_mode: self.f.p.t8x8 };
+        let nb = NbCtx { left, top, cur: &self.mbs[idx], slice_type: self.f.st, prev_dqp_nz, t8x8_mode: self.f.p.t8x8, field: self.f.p.field.is_some() };
         if let Some(cab) = self.cabac.as_mut() {
             if nb.slice_type != SliceType::I {
                 cabac_mb::write_skip_flag(cab, &nb, kind.is_skip());
@@ -511,7 +525,8 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
         info.cbp = c.code.cbp;
         let mut code = c.code.clone();
         code.qp_delta = qp as i32 - self.last_qp as i32;
-        let nb = NbCtx { left, top, cur: &info, slice_type: self.f.st, prev_dqp_nz: self.prev_dqp_nz, t8x8_mode: self.f.p.t8x8 };
+        let nb =
+            NbCtx { left, top, cur: &info, slice_type: self.f.st, prev_dqp_nz: self.prev_dqp_nz, t8x8_mode: self.f.p.t8x8, field: self.f.p.field.is_some() };
         if let Some(cab) = self.cabac.as_ref() {
             let mut est = CabacEstimator::new(cab.ctx.clone(), self.f.cost_tab);
             if nb.slice_type != SliceType::I {
@@ -574,7 +589,7 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
                 }
                 let mut scan = [0i16; 16];
                 for k in 1..16 {
-                    scan[k] = t[ZIGZAG4[k]] as i16;
+                    scan[k] = t[self.f.p.scan4()[k]] as i16;
                 }
                 ac_score += decimate_score(&scan[1..]);
                 c.code.cac[comp * 4 + b] = scan;
@@ -678,7 +693,7 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
             }
             let mut scan = [0i16; 16];
             for k in 0..16 {
-                scan[k] = t[ZIGZAG4[k]] as i16;
+                scan[k] = t[self.f.p.scan4()[k]] as i16;
             }
             score8[blk / 4] += decimate_score(&scan);
             c.code.luma4[blk] = scan;
@@ -741,7 +756,7 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
             quant8(&mut t, qt, qp, dz);
             let mut scan = [0i16; 64];
             for k in 0..64 {
-                scan[k] = t[ZIGZAG8[k]] as i16;
+                scan[k] = t[self.f.p.scan8()[k]] as i16;
             }
             score[b8] = decimate_score(&scan);
             c.code.luma8[b8] = scan;
@@ -888,7 +903,7 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
             }
         }
         for k in 0..16 {
-            c.code.luma_dc[k] = dcl[ZIGZAG4[k]] as i16;
+            c.code.luma_dc[k] = dcl[self.f.p.scan4()[k]] as i16;
         }
         let ac_any = coefs.iter().any(|t| t[1..].iter().any(|&v| v != 0));
         let dcq = dequant_luma_dc(&dcl, qt, qp);
@@ -898,7 +913,7 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
             let mut t = coefs[blk];
             let mut scan = [0i16; 16];
             for k in 1..16 {
-                scan[k] = t[ZIGZAG4[k]] as i16;
+                scan[k] = t[self.f.p.scan4()[k]] as i16;
             }
             c.code.luma4[blk] = if ac_any { scan } else { [0; 16] };
             let nz = if ac_any { scan.iter().filter(|&&v| v != 0).count() as u8 } else { 0 };
@@ -1092,7 +1107,7 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
             }
             let mut scan = [0i16; 16];
             for k in 0..16 {
-                scan[k] = t[ZIGZAG4[k]] as i16;
+                scan[k] = t[self.f.p.scan4()[k]] as i16;
             }
             c.code.luma4[blk] = scan;
             c.info.nnz[by * 4 + bx] = nz as u8;
@@ -1176,7 +1191,7 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
             let nz = quant8(&mut t, qt, qp, Deadzone::INTRA);
             let mut scan = [0i16; 64];
             for k in 0..64 {
-                scan[k] = t[ZIGZAG8[k]] as i16;
+                scan[k] = t[self.f.p.scan8()[k]] as i16;
             }
             c.code.luma8[b8] = scan;
             for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {

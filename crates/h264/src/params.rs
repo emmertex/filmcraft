@@ -515,10 +515,18 @@ impl Sps {
         self.max_dpb_frames()
     }
 
+    /// Whether a decoder that only handles progressive (frame) coding can decode streams of this
+    /// SPS (hardware paths driven by this crate's parsers); the software [`crate::Decoder`] also
+    /// decodes interlaced streams (see [`Sps::check_decodable`]).
     pub fn check_supported(&self) -> Result<()> {
         if !self.frame_mbs_only {
             return unsupported("interlaced (field / MBAFF) coding");
         }
+        self.check_decodable()
+    }
+
+    /// Whether the software decoder can decode streams of this SPS (interlaced coding included).
+    pub fn check_decodable(&self) -> Result<()> {
         if self.chroma_array_type() != 1 {
             return unsupported(format!("chroma_format_idc {} (only 4:2:0 is implemented)", self.chroma_format_idc));
         }

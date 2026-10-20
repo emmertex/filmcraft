@@ -324,7 +324,7 @@ impl H264Decoder {
 }
 
 /// An H.264 decoder error as a [`CodecError`]: a feature the decoder does not implement (High
-/// 4:2:2, field pictures...) is [`CodecError::Unsupported`], so the media pool shows the
+/// 4:2:2, FMO...) is [`CodecError::Unsupported`], so the media pool shows the
 /// unreadable slate instead of a black picture (#626); anything else is a decode error.
 fn h264_error(e: filmcraft_h264::Error) -> CodecError {
     match e {

@@ -439,7 +439,8 @@ impl PocState {
                     prev_msb
                 };
                 let top = msb + lsb;
-                let bottom = top + sh.delta_pic_order_cnt_bottom;
+                // a field picture has only its own order count (reported for both fields)
+                let bottom = if sh.field_pic { top } else { top + sh.delta_pic_order_cnt_bottom };
                 Poc { top, bottom, msb, frame_num_offset: 0 }
             }
             1 => {
@@ -464,6 +465,11 @@ impl PocState {
                 }
                 let top = expected + sh.delta_pic_order_cnt[0];
                 let bottom = top + sps.offset_for_top_to_bottom_field + sh.delta_pic_order_cnt[1];
+                if sh.field_pic {
+                    // BottomFieldOrderCnt of a bottom field: expected + offset + delta[0]
+                    let v = if sh.bottom_field { expected + sps.offset_for_top_to_bottom_field + sh.delta_pic_order_cnt[0] } else { top };
+                    return Poc { top: v, bottom: v, msb: 0, frame_num_offset };
+                }
                 Poc { top, bottom, msb: 0, frame_num_offset }
             }
             _ => {
