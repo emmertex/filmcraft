@@ -166,6 +166,17 @@ pub struct EncoderConfig {
     /// Requested level_idc (41 = level 4.1); None = the lowest level that fits. A level too low
     /// for the stream is raised to the one it needs.
     pub level: Option<u8>,
+    /// Testing aid, not an interlaced encoder: code every picture as a field picture of this
+    /// parity (0 = top, 1 = bottom) of a PAFF stream. The input frames are the fields
+    /// (`height` is the field height, a multiple of 16) and references are always the previous
+    /// field of the same parity. Interleaving the access units of the encoders of the first and
+    /// of the second field ([`EncoderConfig::field_second`]) gives a field-coded stream.
+    #[doc(hidden)]
+    pub field_parity: Option<u8>,
+    /// With `field_parity`: this encoder codes the second field of each frame (IDR frames get a
+    /// non-IDR I field, order counts are one higher).
+    #[doc(hidden)]
+    pub field_second: bool,
 }
 
 impl EncoderConfig {
@@ -192,6 +203,8 @@ impl EncoderConfig {
             content_light: None,
             aud: true,
             level: None,
+            field_parity: None,
+            field_second: false,
         }
     }
 }
@@ -388,6 +401,7 @@ impl Encoder {
                 adaptive_t8: false,
                 always_intra: false,
                 cavlc_clamp: !cabac,
+                field: cfg.field_parity,
             },
             Preset::Balanced => EncParams {
                 mbw,
@@ -406,6 +420,7 @@ impl Encoder {
                 adaptive_t8: high,
                 always_intra: false,
                 cavlc_clamp: !cabac,
+                field: cfg.field_parity,
             },
             Preset::Quality => EncParams {
                 mbw,
@@ -424,6 +439,7 @@ impl Encoder {
                 adaptive_t8: high,
                 always_intra: true,
                 cavlc_clamp: !cabac,
+                field: cfg.field_parity,
             },
         };
         let max_refs = if cfg.bframes > 0 { 2 } else { 1 };
@@ -464,7 +480,10 @@ impl Encoder {
             crop_bottom: mbh as u32 * 16 - cfg.height,
             log2_max_frame_num: LOG2_MAX_FRAME_NUM,
             log2_max_poc_lsb: LOG2_MAX_POC_LSB,
-            max_num_ref_frames: max_refs as u32,
+            // field coding: the second field references the previous frame's field of its parity
+            // while the first field of its own frame is a reference too
+            max_num_ref_frames: max_refs as u32 + cfg.field_parity.is_some() as u32,
+            field: cfg.field_parity.is_some(),
             vui: Vui {
                 sar: cfg.sar,
                 video_full_range: cfg.color.full_range,
@@ -474,7 +493,7 @@ impl Encoder {
                 num_units_in_tick: cfg.fps_den,
                 time_scale: cfg.fps_num.saturating_mul(2),
                 max_num_reorder_frames: reorder,
-                max_dec_frame_buffering: max_refs as u32,
+                max_dec_frame_buffering: max_refs as u32 + cfg.field_parity.is_some() as u32,
             },
         };
         let pps = Pps { cabac, pic_init_qp: 26, chroma_qp_offset: params.chroma_qp_offset, transform_8x8: params.t8x8, high };
@@ -753,12 +772,14 @@ impl Encoder {
                 first_mb: 0,
                 slice_type: st,
                 nal_ref_idc,
-                idr,
+                // the second field of an IDR frame is a non-IDR I field
+                idr: idr && !(self.cfg.field_parity.is_some() && self.cfg.field_second),
                 idr_pic_id: self.idr_count % 2,
                 frame_num: self.next_frame_num % (1 << LOG2_MAX_FRAME_NUM),
                 log2_max_frame_num: LOG2_MAX_FRAME_NUM,
-                poc_lsb: (poc as u32) % (1 << LOG2_MAX_POC_LSB),
+                poc_lsb: (poc as u32 + (self.cfg.field_parity.is_some() && self.cfg.field_second) as u32) % (1 << LOG2_MAX_POC_LSB),
                 log2_max_poc_lsb: LOG2_MAX_POC_LSB,
+                field: self.cfg.field_parity,
                 l0_modification: None,
                 cabac: self.params.cabac,
                 slice_qp: qp as i32,
@@ -796,7 +817,7 @@ impl Encoder {
                     aq: &j.aq,
                     hdr: j.hdr.clone(),
                     nal_ref_idc: j.nal_ref_idc,
-                    nal_type: if j.idr { NAL_IDR } else { NAL_SLICE },
+                    nal_type: if j.hdr.idr { NAL_IDR } else { NAL_SLICE },
                     cabac_table: if j.hdr.slice_type == SliceType::I { &this.cabac_i } else { &this.cabac_pb },
                     lam: &this.lam,
                 })
@@ -808,6 +829,7 @@ impl Encoder {
                     beta_offset: 0,
                     chroma_qp_offset: this.params.chroma_qp_offset,
                     ref_ids: [j.l0.map_or(-1, |i| this.dpb[i].id as i32), j.l1.map_or(-1, |i| this.dpb[i].id as i32)],
+                    field: this.cfg.field_parity.is_some(),
                 })
                 .collect();
             let deblock: Vec<bool> = jobs.iter().map(|j| j.hdr.slice_type != SliceType::B || capture).collect();

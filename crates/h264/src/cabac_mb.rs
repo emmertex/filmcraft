@@ -14,6 +14,12 @@ const SIG8_FRAME: [u8; 63] = [
     0, 1, 2, 3, 4, 5, 5, 4, 4, 3, 3, 4, 4, 4, 5, 5, 4, 4, 4, 4, 3, 3, 6, 7, 7, 7, 8, 9, 10, 9, 8, 7,
     7, 6, 11, 12, 13, 11, 6, 7, 8, 9, 14, 10, 9, 8, 6, 11, 12, 13, 11, 6, 9, 14, 10, 9, 11, 12, 13, 11, 14, 10, 12,
 ];
+/// Table 9-43: significant_coeff_flag ctxIdxInc for 8x8 field blocks.
+#[rustfmt::skip]
+const SIG8_FIELD: [u8; 63] = [
+    0, 1, 1, 2, 2, 3, 3, 4, 5, 6, 7, 7, 7, 8, 4, 5, 6, 9, 10, 10, 8, 11, 12, 11, 9, 9, 10, 10, 8, 11, 12, 11,
+    9, 9, 10, 10, 8, 11, 12, 11, 9, 9, 10, 10, 8, 13, 13, 9, 9, 10, 10, 8, 13, 13, 9, 9, 10, 10, 14, 14, 14, 14, 14,
+];
 /// Table 9-43: last_significant_coeff_flag ctxIdxInc for 8x8 blocks.
 #[rustfmt::skip]
 const LAST8: [u8; 63] = [
@@ -382,10 +388,17 @@ impl SliceDecoder<'_> {
         if cat != 5 && c.decode_decision(85 + CAT_OFFSET[cat].0 + cbf_inc) == 0 {
             return 0;
         }
-        let (sig_base, last_base, abs_base) =
-            if cat == 5 { (402, 417, 426) } else { (105 + CAT_OFFSET[cat].1, 166 + CAT_OFFSET[cat].1, 227 + CAT_OFFSET[cat].2) };
+        // field macroblocks have their own significance map contexts (Table 9-34)
+        let field = self.field_mb;
+        let (sig_base, last_base, abs_base) = match (cat, field) {
+            (5, false) => (402, 417, 426),
+            (5, true) => (436, 451, 426),
+            (_, false) => (105 + CAT_OFFSET[cat].1, 166 + CAT_OFFSET[cat].1, 227 + CAT_OFFSET[cat].2),
+            (_, true) => (277 + CAT_OFFSET[cat].1, 338 + CAT_OFFSET[cat].1, 227 + CAT_OFFSET[cat].2),
+        };
         let (sig_tab, last_tab): (&[u8], &[u8]) = match cat {
             3 => (&CHROMA_DC_CTX, &CHROMA_DC_CTX),
+            5 if field => (&SIG8_FIELD, &LAST8),
             5 => (&SIG8_FRAME, &LAST8),
             _ => (&IDENT_CTX, &IDENT_CTX),
         };

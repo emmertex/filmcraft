@@ -42,6 +42,8 @@ pub struct Sps {
     pub log2_max_frame_num: u32,
     pub log2_max_poc_lsb: u32,
     pub max_num_ref_frames: u32,
+    /// Field pictures (`frame_mbs_only_flag` 0, no MBAFF); `height_mbs` counts field rows.
+    pub field: bool,
     pub vui: Vui,
 }
 
@@ -66,7 +68,10 @@ impl Sps {
         w.write_bit(false); // gaps_in_frame_num_value_allowed_flag
         w.write_ue(self.width_mbs - 1);
         w.write_ue(self.height_mbs - 1);
-        w.write_bit(true); // frame_mbs_only_flag
+        w.write_bit(!self.field); // frame_mbs_only_flag
+        if self.field {
+            w.write_bit(false); // mb_adaptive_frame_field_flag
+        }
         w.write_bit(true); // direct_8x8_inference_flag
         let crop = self.crop_right > 0 || self.crop_bottom > 0;
         w.write_bit(crop);
@@ -218,6 +223,8 @@ pub struct SliceHeader {
     pub log2_max_frame_num: u32,
     pub poc_lsb: u32,
     pub log2_max_poc_lsb: u32,
+    /// Field picture of this parity (field_pic_flag 1).
+    pub field: Option<u8>,
     /// Reorder RefPicList0 so that this picNum difference (abs_diff_pic_num_minus1, subtract) comes first.
     pub l0_modification: Option<u32>,
     pub cabac: bool,
@@ -235,6 +242,10 @@ impl SliceHeader {
         w.write_ue(self.slice_type as u32);
         w.write_ue(0); // pic_parameter_set_id
         w.write_bits(self.frame_num, self.log2_max_frame_num);
+        if let Some(p) = self.field {
+            w.write_bit(true); // field_pic_flag
+            w.write_bit(p == 1); // bottom_field_flag
+        }
         if self.idr {
             w.write_ue(self.idr_pic_id);
         }

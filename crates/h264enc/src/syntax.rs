@@ -85,6 +85,8 @@ pub struct NbCtx<'a> {
     pub slice_type: SliceType,
     pub prev_dqp_nz: bool,
     pub t8x8_mode: bool,
+    /// Field picture: field scan / field significance map contexts.
+    pub field: bool,
 }
 
 impl NbCtx<'_> {

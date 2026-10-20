@@ -1,6 +1,6 @@
 //! Clean-room pure-Rust H.264 / AVC decoder, implemented from ITU-T Rec. H.264 (ISO/IEC 14496-10).
 //!
-//! Supported: progressive (frame) coding, 8-bit 4:2:0, Baseline / Main / High profiles — CAVLC and CABAC,
+//! Supported: progressive (frame) coding and interlaced field pictures (PAFF), 8-bit 4:2:0, Baseline / Main / High profiles — CAVLC and CABAC,
 //! I/P/B slices, 8x8 transform, custom scaling matrices, weighted prediction, spatial/temporal direct,
 //! multiple slices, long-term references and all MMCOs, deblocking.
 //!
@@ -83,4 +83,8 @@ pub struct Picture {
     /// filter was skipped. Its samples are approximate (not the conforming output); no other
     /// picture is affected.
     pub draft: bool,
+    /// The stream is interlaced (`frame_mbs_only_flag` 0): the picture is a frame or a pair of
+    /// fields (interleaved here, top field on even lines) coded as field pictures or MBAFF /
+    /// frame pictures. A field decoded without its pair repeats its lines for the missing field.
+    pub interlaced: bool,
 }

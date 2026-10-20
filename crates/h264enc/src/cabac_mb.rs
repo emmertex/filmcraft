@@ -4,7 +4,7 @@ use crate::cabac::BinSink;
 use crate::mbinfo::{MbInfo, MbKind, Part};
 use crate::nal::SliceType;
 use crate::syntax::{MbCode, NbCtx};
-use crate::tables::{BLK4_XY, LAST8X8, SIG8X8_FRAME};
+use crate::tables::{BLK4_XY, LAST8X8, SIG8X8_FIELD, SIG8X8_FRAME};
 
 pub fn write_skip_flag<S: BinSink>(s: &mut S, nb: &NbCtx, skip: bool) {
     let cond = |m: Option<&MbInfo>| m.is_some_and(|m| !m.kind.is_skip()) as usize;
@@ -202,7 +202,7 @@ pub enum Cat {
 }
 
 /// Encode one residual block; `coeffs` are the block's coefficients in scan order (length = maxNumCoeff).
-pub fn write_residual<S: BinSink>(s: &mut S, cat: Cat, coeffs: &[i16], cbf_inc: u32) {
+pub fn write_residual<S: BinSink>(s: &mut S, cat: Cat, coeffs: &[i16], cbf_inc: u32, field: bool) {
     const CBF_OFF: [usize; 5] = [0, 4, 8, 12, 16];
     const SIG_OFF: [usize; 5] = [0, 15, 29, 44, 47];
     const ABS_OFF: [usize; 5] = [0, 10, 20, 30, 39];
@@ -213,10 +213,17 @@ pub fn write_residual<S: BinSink>(s: &mut S, cat: Cat, coeffs: &[i16], cbf_inc: 
         s.decision(85 + CBF_OFF[ci] + cbf_inc as usize, last.is_some() as u32);
     }
     let Some(last) = last else { return };
-    let (sig_base, last_base, abs_base) = if cat == Cat::Luma8x8 { (402, 417, 426) } else { (105 + SIG_OFF[ci], 166 + SIG_OFF[ci], 227 + ABS_OFF[ci]) };
+    // field pictures use the field significance map contexts (Table 9-34)
+    let (sig_base, last_base, abs_base) = match (cat == Cat::Luma8x8, field) {
+        (true, false) => (402, 417, 426),
+        (true, true) => (436, 451, 426),
+        (false, false) => (105 + SIG_OFF[ci], 166 + SIG_OFF[ci], 227 + ABS_OFF[ci]),
+        (false, true) => (277 + SIG_OFF[ci], 338 + SIG_OFF[ci], 227 + ABS_OFF[ci]),
+    };
     for i in 0..n - 1 {
         let (si, li) = match cat {
             Cat::ChromaDc => (i.min(2), i.min(2)),
+            Cat::Luma8x8 if field => (SIG8X8_FIELD[i] as usize, LAST8X8[i] as usize),
             Cat::Luma8x8 => (SIG8X8_FRAME[i] as usize, LAST8X8[i] as usize),
             _ => (i, i),
         };
@@ -372,11 +379,11 @@ pub fn write_mb<S: BinSink>(s: &mut S, nb: &NbCtx, c: &MbCode) {
     }
     // ---- residual
     if c.kind == MbKind::I16x16 {
-        write_residual(s, Cat::LumaDc, &c.luma_dc, cbf_dc(nb, 0));
+        write_residual(s, Cat::LumaDc, &c.luma_dc, cbf_dc(nb, 0), nb.field);
         if c.cbp & 15 != 0 {
             for blk in 0..16 {
                 let (x, y) = BLK4_XY[blk];
-                write_residual(s, Cat::LumaAc, &c.luma4[blk][1..16], cbf_luma(nb, y * 4 + x));
+                write_residual(s, Cat::LumaAc, &c.luma4[blk][1..16], cbf_luma(nb, y * 4 + x), nb.field);
             }
         }
     } else {
@@ -385,12 +392,12 @@ pub fn write_mb<S: BinSink>(s: &mut S, nb: &NbCtx, c: &MbCode) {
                 continue;
             }
             if c.t8x8 {
-                write_residual(s, Cat::Luma8x8, &c.luma8[b8], 0);
+                write_residual(s, Cat::Luma8x8, &c.luma8[b8], 0, nb.field);
             } else {
                 for i in 0..4 {
                     let blk = b8 * 4 + i;
                     let (x, y) = BLK4_XY[blk];
-                    write_residual(s, Cat::Luma4x4, &c.luma4[blk], cbf_luma(nb, y * 4 + x));
+                    write_residual(s, Cat::Luma4x4, &c.luma4[blk], cbf_luma(nb, y * 4 + x), nb.field);
                 }
             }
         }
@@ -398,13 +405,13 @@ pub fn write_mb<S: BinSink>(s: &mut S, nb: &NbCtx, c: &MbCode) {
     let chroma = c.cbp >> 4;
     if chroma != 0 {
         for comp in 0..2 {
-            write_residual(s, Cat::ChromaDc, &c.cdc[comp], cbf_dc(nb, 1 + comp as u8));
+            write_residual(s, Cat::ChromaDc, &c.cdc[comp], cbf_dc(nb, 1 + comp as u8), nb.field);
         }
     }
     if chroma == 2 {
         for comp in 0..2 {
             for b in 0..4 {
-                write_residual(s, Cat::ChromaAc, &c.cac[comp * 4 + b][1..16], cbf_chroma_ac(nb, comp, b));
+                write_residual(s, Cat::ChromaAc, &c.cac[comp * 4 + b][1..16], cbf_chroma_ac(nb, comp, b), nb.field);
             }
         }
     }

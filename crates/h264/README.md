@@ -33,6 +33,14 @@ oracles and fixture generators.
   8x8-transform edges.
 - Output: cropped 8-bit planar 4:2:0 pictures in output order with the caller's `pts`, POC, key
   flag, VUI colour description (range, primaries, transfer, matrix) and sample aspect ratio.
+- Interlaced streams (`frame_mbs_only_flag` 0) with field pictures (PAFF): complementary field
+  pairs share a frame buffer in the DPB, field reference lists (8.2.4.2.5 parity alternation),
+  field picture numbers in list modification and MMCOs, non-paired fields, field POCs, field scans
+  and CABAC field contexts, the chroma vector offset for opposite-parity references, field
+  deblocking (bS 3 on horizontal intra MB edges, field units for motion differences) and direct
+  prediction / co-location across frame and field pictures (Tables 8-6, 8-8). Output is one
+  interleaved frame per frame or field pair (`Picture::interlaced`); a field without its pair
+  repeats its lines. Frame pictures of interlaced streams without MBAFF decode as well.
 - Frame-level multithreading (see below).
 - Draft mode for reduced-resolution playback (off by default): non-reference pictures skip the
   deblocking filter and are flagged `Picture::draft`; every other picture stays bit-exact.
@@ -115,6 +123,10 @@ with ffmpeg + libx264; tests print a message and skip when `/opt/homebrew/bin/ff
   mode (`draft_mode_changes_only_flagged_non_reference_pictures`): on five B-pyramid / B-frame
   fixtures, single- and frame-threaded, every unflagged picture is bit-exact and only flagged
   pictures differ.
+- Interlaced (`tests/interlaced.rs`): PAFF streams from two `filmcraft-h264enc` field encoders
+  (one per parity, interleaved; CAVLC I/P top and bottom field first, CABAC with B fields, High
+  with 8x8 transforms, single- and multi-threaded) must equal the encoders' reconstructions
+  interleaved line by line, bit for bit; a trailing unpaired field is output with repeated lines.
 - Vectorised kernels against their straightforward forms on random input: the deblocking edge
   filter against the per-line filter, the 4x4 / 8x8 inverse transforms against the per-column
   formulation.
@@ -201,8 +213,7 @@ file; `H264_BENCH_ITERS=n` (and `H264_THREADS=t`, `H264_DRAFT=1`) turns it into 
 
 ## Known gaps
 
-- Interlaced coding (field pictures, PAFF, MBAFF): streams with `frame_mbs_only_flag = 0` return
-  `Error::Unsupported`.
+- MBAFF frames (`mb_adaptive_frame_field_flag` with frame pictures) return `Error::Unsupported`.
 - Only 8-bit 4:2:0. High 10 / 4:2:2 / 4:4:4 / monochrome and lossless
   (`qpprime_y_zero_transform_bypass`) return `Error::Unsupported`.
 - FMO (slice groups), SP/SI slices, data partitioning (Extended profile), MVC/SVC NAL units.

@@ -13,6 +13,9 @@ pub struct DeblockParams {
     pub chroma_qp_offset: i32,
     /// Picture identity for (list, ref_idx 0).
     pub ref_ids: [i32; 2],
+    /// Field picture: intra horizontal macroblock edges get bS 3 and vertical motion vector
+    /// differences count in field units (8.7.2.1).
+    pub field: bool,
 }
 
 /// A mutable band of rows of a padded plane: sample (x, y) with y relative to the band top.
@@ -41,11 +44,13 @@ fn nz8(m: &MbInfo, blk: usize) -> bool {
 }
 
 #[inline]
-fn mvdiff(a: Mv, b: Mv) -> bool {
-    (a.x as i32 - b.x as i32).abs() >= 4 || (a.y as i32 - b.y as i32).abs() >= 4
+fn mvdiff_lim(a: Mv, b: Mv, ylim: i32) -> bool {
+    (a.x as i32 - b.x as i32).abs() >= 4 || (a.y as i32 - b.y as i32).abs() >= ylim
 }
 
-fn bs_inter(p: &MbInfo, ip: usize, q: &MbInfo, iq: usize, ids: &[i32; 2]) -> u8 {
+fn bs_inter(p: &MbInfo, ip: usize, q: &MbInfo, iq: usize, ids: &[i32; 2], field: bool) -> u8 {
+    let ylim = if field { 2 } else { 4 };
+    let mvdiff = |a, b| mvdiff_lim(a, b, ylim);
     if nz8(p, ip) || nz8(q, iq) {
         return 2;
     }
@@ -86,11 +91,11 @@ fn bs_inter(p: &MbInfo, ip: usize, q: &MbInfo, iq: usize, ids: &[i32; 2]) -> u8 
 }
 
 #[inline]
-fn bs_of(p: &MbInfo, ip: usize, q: &MbInfo, iq: usize, mb_edge: bool, ids: &[i32; 2]) -> u8 {
+fn bs_of(p: &MbInfo, ip: usize, q: &MbInfo, iq: usize, mb_edge: bool, horizontal: bool, ids: &[i32; 2], field: bool) -> u8 {
     if p.kind.is_intra() || q.kind.is_intra() {
-        return if mb_edge { 4 } else { 3 };
+        return if mb_edge && !(field && horizontal) { 4 } else { 3 };
     }
-    bs_inter(p, ip, q, iq, ids)
+    bs_inter(p, ip, q, iq, ids, field)
 }
 
 #[inline]
@@ -198,7 +203,7 @@ pub fn deblock_band<'a>(y: &mut BandPlane<'a>, u: &mut BandPlane<'a>, v: &mut Ba
                             let iq = e * 4 + s;
                             (iq, if e == 0 { 12 + s } else { iq - 4 })
                         };
-                        bs[s] = bs_of(p_mb, ip, q, iq, e == 0, ids);
+                        bs[s] = bs_of(p_mb, ip, q, iq, e == 0, dir == 1, ids, dp.field);
                     }
                     bs_all[e] = bs;
                     if bs == [0; 4] {

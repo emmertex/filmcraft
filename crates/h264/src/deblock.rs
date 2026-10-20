@@ -30,13 +30,16 @@ fn block_motion(st: &MbState, ids8: &[[u32; 2]; 4], raster: usize) -> Motion {
     Motion { ids, mv: [st.mv[0][raster], st.mv[1][raster]], count }
 }
 
+/// Motion vectors differ by a quarter sample or more; `ylim` is 4 (frame macroblocks) or 2 (field
+/// macroblocks: vertical components in field units, 8.7.2.1).
 #[inline(always)]
-fn mv_far(a: [i16; 2], b: [i16; 2]) -> bool {
-    (a[0] as i32 - b[0] as i32).abs() >= 4 || (a[1] as i32 - b[1] as i32).abs() >= 4
+fn mv_far(a: [i16; 2], b: [i16; 2], ylim: i32) -> bool {
+    (a[0] as i32 - b[0] as i32).abs() >= 4 || (a[1] as i32 - b[1] as i32).abs() >= ylim
 }
 
 #[inline]
-fn motion_bs(p: &Motion, q: &Motion) -> u8 {
+fn motion_bs(p: &Motion, q: &Motion, ylim: i32) -> u8 {
+    let mv_far = |a, b| mv_far(a, b, ylim);
     if p.ids == q.ids && p.mv == q.mv {
         return 0;
     }
@@ -303,12 +306,17 @@ pub fn deblock_mb(pic: &mut PicState, addr: usize, mb_w: usize) {
     let alpha_off = sq.alpha_offset;
     let beta_off = sq.beta_offset;
     let t8 = q.transform_8x8;
+    // field macroblocks (field pictures): intra horizontal macroblock edges get bS 3, vertical
+    // motion vector differences are counted in field units
+    let field = q.field;
+    let ylim = if field { 2 } else { 4 };
+    let intra_edge = |dir: usize| if field && dir == 1 { 3 } else { 4 };
     // bS[dir][edge][segment]; dir 0 = vertical edges (x), 1 = horizontal edges (y)
     let mut bs = [[[0u8; 4]; 4]; 2];
     if q.kind.is_intra() {
         for dir in 0..2 {
             if (if dir == 0 { left } else { top }).is_some() {
-                bs[dir][0] = [4; 4];
+                bs[dir][0] = [intra_edge(dir); 4];
             }
             for e in 1..4 {
                 if !(t8 && e % 2 == 1) {
@@ -328,13 +336,13 @@ pub fn deblock_mb(pic: &mut PicState, addr: usize, mb_w: usize) {
             if let Some(n) = neighbor {
                 let p = &pic.mbs[n];
                 if p.kind.is_intra() {
-                    bs[dir][0] = [4; 4];
+                    bs[dir][0] = [intra_edge(dir); 4];
                 } else {
                     let pids = ref_ids8(p, &pic.slices[p.slice_num as usize]);
                     for k in 0..4 {
                         let (rq, rp) = if dir == 0 { (k * 4, k * 4 + 3) } else { (k, 12 + k) };
                         bs[dir][0][k] =
-                            if (p.nz_mask >> rp) & 1 != 0 || (q.nz_mask >> rq) & 1 != 0 { 2 } else { motion_bs(&block_motion(p, &pids, rp), &qm[rq]) };
+                            if (p.nz_mask >> rp) & 1 != 0 || (q.nz_mask >> rq) & 1 != 0 { 2 } else { motion_bs(&block_motion(p, &pids, rp), &qm[rq], ylim) };
                     }
                 }
             }
@@ -348,7 +356,7 @@ pub fn deblock_mb(pic: &mut PicState, addr: usize, mb_w: usize) {
                 }
                 for k in 0..4 {
                     let (rq, rp) = if dir == 0 { (k * 4 + e, k * 4 + e - 1) } else { (e * 4 + k, e * 4 + k - 4) };
-                    bs[dir][e][k] = if (q.nz_mask >> rp) & 1 != 0 || (q.nz_mask >> rq) & 1 != 0 { 2 } else { motion_bs(&qm[rp], &qm[rq]) };
+                    bs[dir][e][k] = if (q.nz_mask >> rp) & 1 != 0 || (q.nz_mask >> rq) & 1 != 0 { 2 } else { motion_bs(&qm[rp], &qm[rq], ylim) };
                 }
             }
         }
