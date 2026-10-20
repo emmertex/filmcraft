@@ -100,6 +100,10 @@ pub(crate) struct TileDecoder<'a, 'f> {
     pub mc_tmp: Vec<i32>,
     /// Coefficient levels of the current transform block, padded (see TX_PAD).
     levels: Vec<u8>,
+    /// (xScale, yScale) of each reference slot (7.11.3.3), computed once per tile.
+    pub ref_scale: [(i64, i64); 8],
+    /// Scan indices of a transform block's non-zero levels (see coeffs()).
+    nz: Vec<u16>,
 }
 
 const SB_MAX: usize = 32; // superblock size in 4x4 units (128 / 4)
@@ -146,6 +150,15 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
             mask: vec![0; 128 * 128],
             mc_tmp: vec![0; (2 * 128 + 8) * 128],
             levels: vec![0; (32 + TX_PAD) * (32 + TX_PAD)],
+            nz: vec![0; 1024],
+            ref_scale: std::array::from_fn(|i| {
+                let (fw, fhh) = (fs.fh.frame_width as i64, fs.fh.frame_height as i64);
+                let ri = &fs.ref_info[i];
+                let rs = REF_SCALE_SHIFT as i64;
+                let xs = (((ri.upscaled_width as i64) << rs) + fw / 2) / fw.max(1);
+                let ys = (((ri.frame_height as i64) << rs) + fhh / 2) / fhh.max(1);
+                (xs, ys)
+            }),
         }
     }
 
@@ -268,7 +281,7 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
                     4 => &mut self.cdf.partition_w64[ctx],
                     _ => &mut self.cdf.partition_w128[ctx],
                 };
-                self.sd.read_symbol(cdf)
+                self.sd.read_symbol_slice(cdf)
             } else if has_cols || has_rows {
                 let pcdf: Vec<u16> = match bsl {
                     2 => self.cdf.partition_w16[ctx].to_vec(),
@@ -966,7 +979,7 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
                     (_, 7) => &mut self.cdf.palette_7_uv_color[ctx],
                     _ => &mut self.cdf.palette_8_uv_color[ctx],
                 };
-                let s = self.sd.read_symbol(cdf);
+                let s = self.sd.read_symbol_slice(cdf);
                 map[rr * 64 + cc] = order[s];
                 j -= 1;
             }
@@ -1387,7 +1400,7 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
         if !self.b.skip {
             let eob = self.coeffs(plane, start_x, start_y, tx_sz);
             if eob > 0 {
-                self.reconstruct(plane, start_x, start_y, tx_sz);
+                self.reconstruct(plane, start_x, start_y, tx_sz, eob);
             }
         }
         for i in 0..step_y {
@@ -1655,8 +1668,7 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
         let h4 = TX_HEIGHT[tx_sz] as usize >> 2;
         let tx_sz_ctx = (TX_SIZE_SQR[tx_sz] as usize + TX_SIZE_SQR_UP[tx_sz] as usize + 1) >> 1;
         let ptype = (plane > 0) as usize;
-        let seg_eob = if tx_sz == TX_16X64 || tx_sz == TX_64X16 { 512 } else { 1024.min(TX_WIDTH[tx_sz] as usize * TX_HEIGHT[tx_sz] as usize) };
-        self.quant[..seg_eob].iter_mut().for_each(|q| *q = 0);
+        // self.quant is all zero here: reconstruct() clears the coefficients it consumed.
         let mut eob = 0usize;
         let mut cul_level = 0u32;
         let mut dc_category = 0u8;
@@ -1711,6 +1723,11 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
             let sig_off: [usize; SIG_REF_DIFF_OFFSET_NUM] = std::array::from_fn(|i| sig[i][0] as usize * stride + sig[i][1] as usize);
             let magr = &MAG_REF_OFFSET_WITH_TX_CLASS[tx_class];
             let mag_off: [usize; 3] = std::array::from_fn(|i| magr[i][0] as usize * stride + magr[i][1] as usize);
+            let mut nz = std::mem::take(&mut self.nz);
+            let mut n_nz = 0;
+            let base_cdf = &mut self.cdf.coeff_base[tx_sz_ctx][ptype];
+            let br_cdf = &mut self.cdf.coeff_br[tx_sz_ctx.min(TX_32X32)][ptype];
+            let ctx_off = &COEFF_BASE_CTX_OFFSET[tx_sz];
             for c in (0..eob).rev() {
                 let pos = scan[c] as usize;
                 let row = pos >> bwl;
@@ -1724,8 +1741,8 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
                     for o in sig_off {
                         mag += (lev[li + o] as u32).min(3);
                     }
-                    let ctx = coeff_base_ctx(tx_sz, tx_class, row, col, mag);
-                    self.sd.read_symbol(&mut self.cdf.coeff_base[tx_sz_ctx][ptype][ctx]) as i32
+                    let ctx = coeff_base_ctx(ctx_off, tx_class, row, col, mag);
+                    self.sd.read_symbol(&mut base_cdf[ctx]) as i32
                 };
                 if level > NUM_BASE_LEVELS as i32 {
                     let mut mag = 0u32;
@@ -1733,8 +1750,9 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
                         mag += (lev[li + o] as u32).min((COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1) as u32);
                     }
                     let ctx = coeff_br_ctx(tx_class, row, col, pos, mag);
+                    let cdf = &mut br_cdf[ctx];
                     for _ in 0..(COEFF_BASE_RANGE / (BR_CDF_SIZE - 1)) {
-                        let br = self.sd.read_symbol(&mut self.cdf.coeff_br[tx_sz_ctx.min(TX_32X32)][ptype][ctx]) as i32;
+                        let br = self.sd.read_symbol(cdf) as i32;
                         level += br;
                         if br < (BR_CDF_SIZE - 1) as i32 {
                             break;
@@ -1743,9 +1761,15 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
                 }
                 self.quant[pos] = level;
                 lev[li] = level as u8;
+                // Scan indices of the non-zero levels, in decoding (reverse scan) order.
+                nz[n_nz] = c as u16;
+                n_nz += (level != 0) as usize;
             }
             self.levels = lev;
-            for c in 0..eob {
+            // Zero levels read no sign and leave Quant[] and culLevel unchanged: visit only the
+            // non-zero ones, in scan order.
+            for &c in nz[..n_nz].iter().rev() {
+                let c = c as usize;
                 let pos = scan[c] as usize;
                 let sign = if self.quant[pos] != 0 {
                     if c == 0 {
@@ -1783,6 +1807,7 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
                     self.quant[pos] = -self.quant[pos];
                 }
             }
+            self.nz = nz;
             cul_level = cul_level.min(63);
         }
         for i in 0..w4 {
@@ -1902,7 +1927,7 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
     }
 
     /// Reconstruct process (7.12.3).
-    fn reconstruct(&mut self, plane: usize, x: usize, y: usize, tx_sz: usize) {
+    fn reconstruct(&mut self, plane: usize, x: usize, y: usize, tx_sz: usize, eob: usize) {
         let dq_denom: i64 = match tx_sz {
             TX_32X32 | TX_16X32 | TX_32X16 | TX_16X64 | TX_64X16 => 2,
             TX_64X64 | TX_32X64 | TX_64X32 => 4,
@@ -1913,7 +1938,6 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
         let w = 1usize << log2w;
         let h = 1usize << log2h;
         let tw = w.min(32);
-        let th = h.min(32);
         let t = self.plane_tx_type;
         let flip_ud = matches!(t, FLIPADST_DCT | FLIPADST_ADST | V_FLIPADST | FLIPADST_FLIPADST);
         let flip_lr = matches!(t, DCT_FLIPADST | ADST_FLIPADST | H_FLIPADST | FLIPADST_FLIPADST);
@@ -1931,31 +1955,34 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
         let qm_level = if fh.quant.using_qmatrix { fh.seg_qm_level[plane][self.b.segment_id] } else { 15 };
         let use_qm = fh.quant.using_qmatrix && t < IDTX && qm_level < 15;
         let lim = 1i64 << (7 + bd);
-        // inverse_transform_2d reads only the top-left tw x th coefficients (stride 64)
-        for i in 0..th {
-            self.dequant[i * 64..i * 64 + tw].fill(0);
-        }
-        for i in 0..th {
-            for j in 0..tw {
-                let qv = self.quant[i * tw + j];
-                if qv == 0 {
-                    continue;
-                }
-                let q = if i == 0 && j == 0 { dc_q } else { ac_q };
-                let q2 = if use_qm {
-                    let m = QUANTIZER_MATRIX[qm_level as usize][(plane > 0) as usize][QM_OFFSET[tx_sz] as usize + i * tw + j] as i64;
-                    (q * m + 16) >> 5
-                } else {
-                    q
-                };
-                let dq = qv as i64 * q2;
-                let mag = (dq.abs() & 0xFFFFFF) / dq_denom;
-                let dq2 = if dq < 0 { -mag } else { mag };
-                self.dequant[i * 64 + j] = dq2.clamp(-lim, lim - 1) as i32;
+        // Only the first `eob` scan positions hold coefficients (pos = i * tw + j); self.quant
+        // and self.dequant are all zero outside them, and both are cleared again below.
+        let scan = &self.get_scan(tx_sz)[..eob];
+        for &pos in scan {
+            let pos = pos as usize;
+            let qv = std::mem::take(&mut self.quant[pos]);
+            if qv == 0 {
+                continue;
             }
+            let (i, j) = (pos / tw, pos % tw);
+            let q = if pos == 0 { dc_q } else { ac_q };
+            let q2 = if use_qm {
+                let m = QUANTIZER_MATRIX[qm_level as usize][(plane > 0) as usize][QM_OFFSET[tx_sz] as usize + pos] as i64;
+                (q * m + 16) >> 5
+            } else {
+                q
+            };
+            let dq = qv as i64 * q2;
+            let mag = (dq.abs() & 0xFFFFFF) / dq_denom;
+            let dq2 = if dq < 0 { -mag } else { mag };
+            self.dequant[i * 64 + j] = dq2.clamp(-lim, lim - 1) as i32;
         }
         let lossless = self.b.lossless;
-        inverse_transform_2d(&self.dequant, &mut self.residual, tx_sz, t, lossless, bd);
+        inverse_transform_2d(&self.dequant, &mut self.residual, tx_sz, t, lossless, bd, eob == 1);
+        for &pos in scan {
+            let pos = pos as usize;
+            self.dequant[(pos / tw) * 64 + pos % tw] = 0;
+        }
         let pl = &mut self.t.cur.planes[plane];
         let max = (1i32 << bd) - 1;
         for i in 0..h {
@@ -2131,13 +2158,13 @@ fn get_tx_class(t: usize) -> usize {
 
 /// Coefficient base context from the neighbourhood magnitude `mag` (get_coeff_base_ctx).
 #[inline(always)]
-fn coeff_base_ctx(tx_sz: usize, tx_class: usize, row: usize, col: usize, mag: u32) -> usize {
+fn coeff_base_ctx(ctx_off: &[[u8; 5]; 5], tx_class: usize, row: usize, col: usize, mag: u32) -> usize {
     let ctx = ((mag + 1) >> 1).min(4) as usize;
     if tx_class == TX_CLASS_2D {
         if row == 0 && col == 0 {
             return 0;
         }
-        return ctx + COEFF_BASE_CTX_OFFSET[tx_sz][row.min(4)][col.min(4)] as usize;
+        return ctx + ctx_off[row.min(4)][col.min(4)] as usize;
     }
     let idx = if tx_class == TX_CLASS_VERT { row } else { col };
     ctx + COEFF_BASE_POS_CTX_OFFSET[idx.min(2)] as usize
