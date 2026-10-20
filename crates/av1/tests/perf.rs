@@ -50,14 +50,12 @@ fn run(frames: &[Vec<u8>], threads: usize) -> Run {
     Run { wall: t.elapsed().as_secs_f64(), cpu, shown, stats: dec.stats() }
 }
 
-fn bench(spec: &Spec) {
+fn bench(spec: &Spec) -> Option<()> {
     // AV1_PERF_ONLY=<substring>[,<substring>...] limits the run to matching fixtures.
     if std::env::var("AV1_PERF_ONLY").is_ok_and(|f| !f.split(',').any(|f| spec.name.contains(f))) {
-        return;
+        return None;
     }
-    let Some(ff) = ffmpeg() else { return };
-    let path = make(&ff, spec);
-    let frames = ivf_frames(&path);
+    let frames = ivf_frames(&path_for(spec)?);
     // Single-threaded: best of 3 by thread CPU time (falls back to wall time).
     let mut best: Option<Run> = None;
     for _ in 0..3 {
@@ -93,6 +91,16 @@ fn bench(spec: &Spec) {
     println!("    {threads} threads: {:6.1} fps (wall, load average {})", b.shown as f64 / m.wall, load_average());
     // Per-stage wall time on the frame workers (stages of different frames overlap).
     println!("{}", stage_line(&format!("    {threads} threads, ms/frame:"), &m.stats));
+    Some(())
+}
+
+/// The fixture for `spec`, or the IVF file named by `AV1_PERF_FILE` (for hosts whose ffmpeg
+/// lacks SVT-AV1; the file stands in for every spec, so pair it with `AV1_PERF_ONLY`).
+fn path_for(spec: &Spec) -> Option<std::path::PathBuf> {
+    if let Ok(f) = std::env::var("AV1_PERF_FILE") {
+        return Some(f.into());
+    }
+    Some(make(&ffmpeg()?, spec))
 }
 
 /// Per-stage milliseconds per frame and share of the total.
