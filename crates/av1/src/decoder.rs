@@ -920,14 +920,17 @@ fn project(fs: &mut FrameState, src: usize, dst_sign: i32) -> bool {
     let Some(rf) = fs.refs[src_idx].clone() else { return false };
     let rd = |a: u32, b: u32| crate::header::relative_dist(&seq, a, b);
     let mi_cols = fh.mi_cols as usize;
+    // Distances depend only on the reference kinds: compute them once, not per 8x8 block.
+    let ref_to_cur = rd(fh.order_hints[src], fh.order_hint);
+    let ref_offset: [i32; NUM_REF_FRAMES] = std::array::from_fn(|r| rd(fh.order_hints[src], ri.saved_order_hints[r]));
+    let ref_to_dst: [i32; NUM_REF_FRAMES] = std::array::from_fn(|d| rd(fh.order_hint, fh.order_hints[d]));
     for y8 in 0..h8 {
         for x8 in 0..w8 {
             let row = (2 * y8 + 1) as usize;
             let col = (2 * x8 + 1) as usize;
             let src_ref = rf.saved_ref_frames[row * mi_cols + col];
             if src_ref > INTRA_FRAME as i8 {
-                let ref_to_cur = rd(fh.order_hints[src], fh.order_hint);
-                let ref_offset = rd(fh.order_hints[src], ri.saved_order_hints[src_ref as usize]);
+                let ref_offset = ref_offset[src_ref as usize];
                 let pos_valid = ref_to_cur.abs() <= MAX_FRAME_DISTANCE as i32 && ref_offset.abs() <= MAX_FRAME_DISTANCE as i32 && ref_offset > 0;
                 if pos_valid {
                     let mv = rf.saved_mvs[row * mi_cols + col];
@@ -936,8 +939,7 @@ fn project(fs: &mut FrameState, src: usize, dst_sign: i32) -> bool {
                     let px = project_pos(x8, proj[1], dst_sign, w8, MAX_OFFSET_WIDTH as i32);
                     if let (Some(py), Some(px)) = (py, px) {
                         for dst in LAST_FRAME..=ALTREF_FRAME {
-                            let ref_to_dst = rd(fh.order_hint, fh.order_hints[dst]);
-                            let pm = get_mv_projection(mv, ref_to_dst, ref_offset);
+                            let pm = get_mv_projection(mv, ref_to_dst[dst], ref_offset);
                             fs.motion_field[dst][(py * w8 + px) as usize] = pm;
                         }
                     }

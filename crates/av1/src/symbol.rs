@@ -42,10 +42,22 @@ impl<'a> SymbolDecoder<'a> {
     }
 
     /// `read_symbol( cdf )`: `cdf` has N + 1 entries (the last is the adaptation counter).
+    /// `read_symbol` for a CDF whose size is only known at run time.
     #[inline]
-    pub fn read_symbol(&mut self, cdf: &mut [u16]) -> usize {
+    pub fn read_symbol_slice(&mut self, cdf: &mut [u16]) -> usize {
         let n = cdf.len() - 1;
         let symbol = self.decode(cdf, n);
+        if !self.disable_update {
+            update_cdf(cdf, n, symbol);
+        }
+        symbol
+    }
+
+    /// Monomorphised per CDF size `K` (= N + 1), so the search and adaptation loops unroll.
+    #[inline]
+    pub fn read_symbol<const K: usize>(&mut self, cdf: &mut [u16; K]) -> usize {
+        let n = K - 1;
+        let symbol = self.decode_fixed(cdf);
         if !self.disable_update {
             update_cdf(cdf, n, symbol);
         }
@@ -74,6 +86,32 @@ impl<'a> SymbolDecoder<'a> {
         symbol
     }
 
+    /// `decode` without data-dependent branches: the spec's search loop stops at the first
+    /// symbol whose `cur` is <= SymbolValue, and `cur` strictly decreases with the symbol index
+    /// (the CDF is non-decreasing and the EC_MIN_PROB term shrinks), so the decoded symbol is
+    /// the number of `cur` values above SymbolValue.
+    #[inline(always)]
+    fn decode_fixed<const K: usize>(&mut self, cdf: &[u16; K]) -> usize {
+        let n = K - 1;
+        let value = (self.win >> self.k) as u32;
+        let r8 = self.range >> 8;
+        // c[0] = range, c[i + 1] = cur of symbol i (c[n] = 0).
+        let mut c = [0u32; K];
+        c[0] = self.range;
+        let mut symbol = 0usize;
+        for i in 0..n - 1 {
+            let f = (1u32 << 15) - cdf[i] as u32;
+            let cur = ((r8 * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT)) + EC_MIN_PROB * (n - i - 1) as u32;
+            c[i + 1] = cur;
+            symbol += (value < cur) as usize;
+        }
+        let (prev, cur) = (c[symbol], c[symbol + 1]);
+        self.range = prev - cur;
+        self.win -= (cur as u64) << self.k;
+        self.renormalize();
+        symbol
+    }
+
     /// Renormalisation (8.2.6): SymbolValue takes `bits` more (inverted) bits, which are
     /// already in the window.
     #[inline(always)]
@@ -93,8 +131,18 @@ impl<'a> SymbolDecoder<'a> {
     /// `read_bool()`
     #[inline]
     pub fn read_bool(&mut self) -> u32 {
-        let cdf = [1u16 << 14, 1 << 15, 0];
-        self.decode(&cdf, 2) as u32
+        // decode() with the fixed CDF { 1 << 14, 1 << 15 }: symbol 0 iff SymbolValue >= cur.
+        let value = (self.win >> self.k) as u32;
+        let cur = ((self.range >> 8) << 7) + EC_MIN_PROB;
+        let bit = (value < cur) as u32;
+        if bit == 0 {
+            self.range -= cur;
+            self.win -= (cur as u64) << self.k;
+        } else {
+            self.range = cur;
+        }
+        self.renormalize();
+        bit
     }
 
     /// `read_literal( n )` (L(n))

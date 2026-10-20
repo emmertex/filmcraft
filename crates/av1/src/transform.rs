@@ -517,7 +517,8 @@ fn col_kind(tx_type: usize) -> Kind1d {
 
 /// 2D inverse transform (7.13.3). `dequant` is 64x64 (row stride 64, only the top-left 32x32
 /// may be non-zero); the residual is written to `residual` with row stride `w`.
-pub(crate) fn inverse_transform_2d(dequant: &[i32], residual: &mut [i32], tx_sz: usize, tx_type: usize, lossless: bool, bit_depth: u32) {
+/// `dc_only`: dequant[0] is the only coefficient that may be non-zero.
+pub(crate) fn inverse_transform_2d(dequant: &[i32], residual: &mut [i32], tx_sz: usize, tx_type: usize, lossless: bool, bit_depth: u32, dc_only: bool) {
     let log2w = TX_WIDTH_LOG2[tx_sz] as u32;
     let log2h = TX_HEIGHT_LOG2[tx_sz] as u32;
     let w = 1usize << log2w;
@@ -532,6 +533,10 @@ pub(crate) fn inverse_transform_2d(dequant: &[i32], residual: &mut [i32], tx_sz:
     let rect2 = log2w.abs_diff(log2h) == 1;
     if !lossless && bit_depth <= 10 {
         let p = Tx2d { w, h, log2w, log2h, row_shift, col_shift, row_clamp, col_clamp, rk, ck, rect2 };
+        if dc_only && rk == Kind1d::Dct && ck == Kind1d::Dct {
+            dc_only_dct(dequant[0], residual, &p);
+            return;
+        }
         if w >= 8 && h >= 8 {
             transform_lanes::<8>(dequant, residual, &p);
         } else {
@@ -609,6 +614,25 @@ fn transform_1d<T: Lane>(t: &mut [T], kind: Kind1d, n: u32, r: u32) {
         Kind1d::Adst => inverse_adst(t, n, r),
         Kind1d::Identity => inverse_identity(t, n),
     }
+}
+
+/// DCT_DCT with only a DC coefficient: in the DCT's butterfly network a lone DC input passes
+/// one rotation by cos(pi/4) and then only additions of zero (clamped to the stage range), so
+/// every output of a 1D pass is the same value and the residual block is flat.
+fn dc_only_dct(dc: i32, residual: &mut [i32], p: &Tx2d) {
+    let pass = |v: i32, r: u32| {
+        let (lo, hi) = (-(1i32 << (r - 1)), (1i32 << (r - 1)) - 1);
+        v.mul_round12(2896).clamp(lo, hi)
+    };
+    let mut v = dc;
+    if p.rect2 {
+        v = v.mul_round12(2896);
+    }
+    let lo = -(1i32 << (p.col_clamp - 1));
+    let hi = (1i32 << (p.col_clamp - 1)) - 1;
+    let row = round2(pass(v, p.row_clamp), p.row_shift).clamp(lo, hi);
+    let out = round2(pass(row, p.col_clamp), p.col_shift);
+    residual[..p.w * p.h].fill(out);
 }
 
 /// The 2D inverse transform with `L` rows (row pass) or columns (column pass) at a time;
