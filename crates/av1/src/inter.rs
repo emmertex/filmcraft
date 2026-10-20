@@ -159,11 +159,14 @@ impl TileDecoder<'_, '_> {
             let ri = &self.fs.ref_info[ref_idx as usize];
             (ri.upscaled_width as i64, ri.frame_height as i64)
         };
-        let fw = fh.frame_width as i64;
-        let fhh = fh.frame_height as i64;
         let rs = REF_SCALE_SHIFT as i64;
-        let x_scale = ((ref_uw << rs) + fw / 2) / fw;
-        let y_scale = ((ref_h << rs) + fhh / 2) / fhh;
+        let (x_scale, y_scale) = if ref_idx < 0 {
+            let fw = fh.frame_width as i64;
+            let fhh = fh.frame_height as i64;
+            (((ref_uw << rs) + fw / 2) / fw, ((ref_h << rs) + fhh / 2) / fhh)
+        } else {
+            self.ref_scale[ref_idx as usize]
+        };
         let (sx, sy) = if plane > 0 { (self.fs.ssx as i32, self.fs.ssy as i32) } else { (0, 0) };
         let half = 1i64 << (SUBPEL_BITS - 1);
         let orig_x = ((x as i64) << SUBPEL_BITS) + ((2 * mv[1]) >> sx) as i64 + half;
@@ -226,6 +229,7 @@ impl TileDecoder<'_, '_> {
         let unit = 1 << SCALE_SUBPEL_BITS;
         if x_step == unit && y_step == unit {
             mc_unscaled(
+                self.fs.bit_depth == 8,
                 refp,
                 last_x,
                 last_y,
@@ -514,10 +518,7 @@ impl TileDecoder<'_, '_> {
         if ref_idx < 0 {
             return false;
         }
-        let fh = &self.fs.fh;
-        let ri = &self.fs.ref_info[ref_idx as usize];
-        let xs = ((ri.upscaled_width << REF_SCALE_SHIFT) + fh.frame_width / 2) / fh.frame_width;
-        let ys = ((ri.frame_height << REF_SCALE_SHIFT) + fh.frame_height / 2) / fh.frame_height;
+        let (xs, ys) = self.ref_scale[ref_idx as usize];
         xs != 1 << REF_SCALE_SHIFT || ys != 1 << REF_SCALE_SHIFT
     }
 
@@ -691,6 +692,30 @@ fn hpass<const W: usize>(src: &[u16], hf: &[i16; 8], out: &mut [i32], half: i32,
     }
 }
 
+/// `hpass` for 8-bit samples: every filter tap is even, so with halved taps the sum stays
+/// within i16 (|sum| <= 255 * 119), which doubles the SIMD width; Round2( 2 * s, r ) =
+/// Round2( s, r - 1 ) keeps it exact.
+#[inline(always)]
+fn hpass8<const W: usize>(src: &[u16], hf: &[i16; 8], out: &mut [i32], sh: u32) {
+    let half = 1i16 << (sh - 2);
+    let mut acc = [half; W];
+    for t in 0..8 {
+        let f = hf[t] >> 1;
+        let Some(p) = src.get(t..).and_then(|s| s.first_chunk::<W>()) else {
+            return;
+        };
+        for j in 0..W {
+            acc[j] = acc[j].wrapping_add(f.wrapping_mul(p[j] as i16));
+        }
+    }
+    let Some(o) = out.first_chunk_mut::<W>() else {
+        return;
+    };
+    for j in 0..W {
+        o[j] = (acc[j] >> (sh - 1)) as i32;
+    }
+}
+
 /// Vertical pass of one output row from 8 intermediate rows (`rows`, stride `W`).
 #[inline(always)]
 fn vpass<const W: usize>(rows: &[i32], vf: &[i16; 8], out: &mut [i32], half: i32, sh: u32) {
@@ -716,6 +741,7 @@ fn vpass<const W: usize>(rows: &[i32], vf: &[i16; 8], out: &mut [i32], half: i32
 /// phase, so the filters run over whole rows (bit-identical to the per-sample process).
 #[allow(clippy::too_many_arguments)]
 fn mc_unscaled(
+    bd8: bool,
     refp: &Plane,
     last_x: i32,
     last_y: i32,
@@ -733,6 +759,27 @@ fn mc_unscaled(
     let y0 = (y >> 10) - 3;
     let h_copy = *hf == IDENTITY_TAPS;
     let v_copy = *vf == IDENTITY_TAPS;
+    if h_copy && v_copy && rnd.0 + rnd.1 <= 14 {
+        // Whole-sample motion: Round2( 128 * ( v << ( 7 - InterRound0 ) ), InterRound1 ) is
+        // exactly v << ( 14 - InterRound0 - InterRound1 ).
+        let sh = 14 - rnd.0 - rnd.1;
+        let (xs, ys) = (x >> 10, y >> 10);
+        let inside = xs >= 0 && xs + w as i32 <= last_x + 1;
+        for r in 0..h {
+            let row = refp.row((ys + r as i32).clamp(0, last_y) as usize);
+            let out = &mut pred[r * PRED_STRIDE..r * PRED_STRIDE + w];
+            if inside {
+                for (o, &v) in out.iter_mut().zip(&row[xs as usize..xs as usize + w]) {
+                    *o = (v as i32) << sh;
+                }
+            } else {
+                for (k, o) in out.iter_mut().enumerate() {
+                    *o = (row[(xs + k as i32).clamp(0, last_x) as usize] as i32) << sh;
+                }
+            }
+        }
+        return;
+    }
     // With the identity vertical phase only intermediate rows 3 .. 3 + h have a non-zero tap.
     let (r_lo, r_hi) = if v_copy { (3, 3 + h) } else { (0, h + 7) };
     let inside = x0 >= 0 && x0 + w as i32 + 7 <= last_x + 1;
@@ -758,13 +805,18 @@ fn mc_unscaled(
                 *o = (v as i32) << (7 - r0);
             }
         } else {
-            match w {
-                2 => hpass::<2>(src, hf, out, half0, r0),
-                4 => hpass::<4>(src, hf, out, half0, r0),
-                8 => hpass::<8>(src, hf, out, half0, r0),
-                16 => hpass::<16>(src, hf, out, half0, r0),
-                32 => hpass::<32>(src, hf, out, half0, r0),
-                64 => hpass::<64>(src, hf, out, half0, r0),
+            match (bd8, w) {
+                (true, 4) => hpass8::<4>(src, hf, out, r0),
+                (true, 8) => hpass8::<8>(src, hf, out, r0),
+                (true, 16) => hpass8::<16>(src, hf, out, r0),
+                (true, 32) => hpass8::<32>(src, hf, out, r0),
+                (true, 64) => hpass8::<64>(src, hf, out, r0),
+                (_, 2) => hpass::<2>(src, hf, out, half0, r0),
+                (_, 4) => hpass::<4>(src, hf, out, half0, r0),
+                (_, 8) => hpass::<8>(src, hf, out, half0, r0),
+                (_, 16) => hpass::<16>(src, hf, out, half0, r0),
+                (_, 32) => hpass::<32>(src, hf, out, half0, r0),
+                (_, 64) => hpass::<64>(src, hf, out, half0, r0),
                 _ => {
                     let acc = &mut acc[..w];
                     acc.fill(0);
