@@ -131,8 +131,18 @@ impl<'a> SymbolDecoder<'a> {
     /// `read_bool()`
     #[inline]
     pub fn read_bool(&mut self) -> u32 {
-        let cdf = [1u16 << 14, 1 << 15, 0];
-        self.decode(&cdf, 2) as u32
+        // decode() with the fixed CDF { 1 << 14, 1 << 15 }: symbol 0 iff SymbolValue >= cur.
+        let value = (self.win >> self.k) as u32;
+        let cur = ((self.range >> 8) << 7) + EC_MIN_PROB;
+        let bit = (value < cur) as u32;
+        if bit == 0 {
+            self.range -= cur;
+            self.win -= (cur as u64) << self.k;
+        } else {
+            self.range = cur;
+        }
+        self.renormalize();
+        bit
     }
 
     /// `read_literal( n )` (L(n))
