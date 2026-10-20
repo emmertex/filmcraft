@@ -292,6 +292,7 @@ impl Frame {
     }
 
     /// The part `s` (frame or one field) has been published completely.
+    #[cfg_attr(not(feature = "threads"), allow(dead_code))]
     pub fn is_part_complete(&self, s: Structure) -> bool {
         match s.parity() {
             Some(p) if self.interlaced => {
@@ -497,10 +498,18 @@ impl Frame {
     /// Copy the w x h luma window at (x0, y0) (clamped to the picture) into `out` (stride `os`).
     #[inline]
     pub fn luma_window(&self, x0: i32, y0: i32, w: usize, h: usize, out: &mut [u8], os: usize) {
-        let height = self.height;
+        let (width, height) = (self.width, self.height);
+        if self.interlaced {
+            for r in 0..h {
+                let yy = (y0 + r as i32).clamp(0, height as i32 - 1) as usize;
+                copy_line::<24>(self.luma_line(yy), x0, &mut out[r * os..], w);
+            }
+            return;
+        }
         for r in 0..h {
             let yy = (y0 + r as i32).clamp(0, height as i32 - 1) as usize;
-            let line = self.luma_line(yy);
+            let row = self.row(yy >> 4);
+            let line = &row.y[(yy & 15) * width..(yy & 15) * width + width];
             copy_line::<24>(line, x0, &mut out[r * os..], w);
         }
     }
@@ -549,10 +558,19 @@ impl Frame {
     /// Copy the w x h window of chroma component `c` at (x0, y0) (clamped) into `out`.
     #[inline]
     pub fn chroma_window(&self, c: usize, x0: i32, y0: i32, w: usize, h: usize, out: &mut [u8], os: usize) {
-        let ch = self.cheight;
+        let (cw, ch) = (self.cwidth, self.cheight);
+        if self.interlaced {
+            for r in 0..h {
+                let yy = (y0 + r as i32).clamp(0, ch as i32 - 1) as usize;
+                copy_line::<16>(self.chroma_line(c, yy), x0, &mut out[r * os..], w);
+            }
+            return;
+        }
         for r in 0..h {
             let yy = (y0 + r as i32).clamp(0, ch as i32 - 1) as usize;
-            let line = self.chroma_line(c, yy);
+            let row = self.row(yy >> 3);
+            let plane = if c == 0 { &row.cb } else { &row.cr };
+            let line = &plane[(yy & 7) * cw..(yy & 7) * cw + cw];
             copy_line::<16>(line, x0, &mut out[r * os..], w);
         }
     }

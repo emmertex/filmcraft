@@ -1,6 +1,6 @@
 //! Clean-room pure-Rust H.264 / AVC decoder, implemented from ITU-T Rec. H.264 (ISO/IEC 14496-10).
 //!
-//! Supported: progressive (frame) coding and interlaced field pictures (PAFF), 8-bit 4:2:0, Baseline / Main / High profiles — CAVLC and CABAC,
+//! Supported: progressive and interlaced coding (field pictures / PAFF, MBAFF frames), 8-bit 4:2:0, Baseline / Main / High profiles — CAVLC and CABAC,
 //! I/P/B slices, 8x8 transform, custom scaling matrices, weighted prediction, spatial/temporal direct,
 //! multiple slices, long-term references and all MMCOs, deblocking.
 //!
@@ -32,6 +32,7 @@ pub mod dpb;
 mod error;
 mod inter;
 mod intra;
+mod mbaff;
 mod mbtypes;
 pub mod params;
 mod picture;

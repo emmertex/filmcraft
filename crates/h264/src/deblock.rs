@@ -1,7 +1,7 @@
-//! Deblocking filter (8.7) for progressive frames, 4:2:0, 8-bit.
+//! Deblocking filter (8.7), 4:2:0, 8-bit: frames, fields and MBAFF frames.
 
 use crate::picture::{MbKind, MbState};
-use crate::slicedec::{PicState, SliceInfo};
+use crate::slicedec::{PicState, SliceInfo, ref_id_of};
 use crate::tables::{ALPHA, BETA, TC0};
 
 /// Reference picture identity + mvs of one 4x4 block, for bS = 1 decisions.
@@ -75,14 +75,12 @@ fn motion_bs(p: &Motion, q: &Motion, ylim: i32) -> u8 {
     }
 }
 
-#[cfg(test)]
 fn clip3(lo: i32, hi: i32, v: i32) -> i32 {
     v.clamp(lo, hi)
 }
 
 /// Filter one set of eight samples p3 p2 p1 p0 | q0 q1 q2 q3 across an edge (8.7.2.3 / 8.7.2.4):
-/// the per-line reference for [`filter_lanes`].
-#[cfg(test)]
+/// the per-line reference for [`filter_lanes`], also used for single lines of MBAFF edges.
 fn filter8(v: &mut [u8; 8], bs: u8, alpha: i32, beta: i32, tc0: i32, chroma: bool) {
     let p0 = v[3] as i32;
     let q0 = v[4] as i32;
@@ -412,6 +410,234 @@ pub fn deblock_mb(pic: &mut PicState, addr: usize, mb_w: usize) {
                     filter_vertical::<8>(plane, cwidth, mx * 8 + ce * 4, my * 8, &ep, true);
                 } else {
                     filter_horizontal::<8>(plane, cwidth, mx * 8, my * 8 + ce * 4, &ep, true);
+                }
+            }
+        }
+    }
+}
+
+/// Edge filter parameters from the QPs of the two macroblocks and the slice offsets.
+fn edge_params(qpp: i32, qpq: i32, b: [u8; 4], alpha_off: i32, beta_off: i32) -> EdgeParams {
+    let qpav = (qpp + qpq + 1) >> 1;
+    let index_a = (qpav + alpha_off).clamp(0, 51) as usize;
+    let index_b = (qpav + beta_off).clamp(0, 51) as usize;
+    let tc = |b: u8| if (1..4).contains(&b) { TC0[index_a][b as usize - 1] as i32 } else { 0 };
+    EdgeParams { bs: b, tc0: [tc(b[0]), tc(b[1]), tc(b[2]), tc(b[3])], alpha: ALPHA[index_a] as i32, beta: BETA[index_b] as i32 }
+}
+
+/// Filter one line of eight samples `pix[o], pix[o + step], ..` (p3 .. q3) with its own bS.
+fn filter_line(pix: &mut [u8], o: usize, step: usize, bs: u8, ep: &EdgeParams, chroma: bool) {
+    if bs == 0 || ep.alpha == 0 || ep.beta == 0 {
+        return;
+    }
+    let mut v = [0u8; 8];
+    for (k, s) in v.iter_mut().enumerate() {
+        let Some(&x) = pix.get(o + k * step) else { return };
+        *s = x;
+    }
+    let tc0 = if bs < 4 { ep.tc0[0] } else { 0 };
+    filter8(&mut v, bs, ep.alpha, ep.beta, tc0, chroma);
+    for (k, s) in v.iter().enumerate() {
+        pix[o + k * step] = *s;
+    }
+}
+
+/// Deblock one macroblock of an MBAFF frame (8.7 with MbaffFrameFlag 1); macroblocks must be
+/// processed in macroblock address order (pair by pair, top then bottom).
+#[allow(clippy::needless_range_loop)]
+pub fn deblock_mb_mbaff(pic: &mut PicState, idx: usize, mb_w: usize) {
+    let Some(&q) = pic.mbs.get(idx) else { return };
+    if q.slice_num == u32::MAX {
+        return;
+    }
+    let Some(sq) = pic.slices.get(q.slice_num as usize) else { return };
+    let (idc, alpha_off, beta_off) = (sq.disable_deblocking_filter_idc, sq.alpha_offset, sq.beta_offset);
+    if idc == 1 {
+        return;
+    }
+    let (mx, my) = (idx % mb_w, idx / mb_w);
+    let (py, bottom) = (my / 2, my % 2);
+    let usable = |n: usize| pic.mbs.get(n).is_some_and(|st| st.slice_num != u32::MAX && !(idc == 2 && st.slice_num != q.slice_num));
+    let (w, cw) = (pic.planes.width, pic.planes.cwidth);
+    // sample row r of the current macroblock is plane[lo + (ly0 + r) * ls ..]
+    let (lo, ls, ly0) = if q.field { (bottom * w, 2 * w, 16 * py) } else { (0, w, 16 * my) };
+    let (co, cs, cy0) = if q.field { (bottom * cw, 2 * cw, 8 * py) } else { (0, cw, 8 * my) };
+    let slices = &pic.slices;
+    let ids8 = |st: &MbState, row: usize| -> [[u32; 2]; 4] {
+        std::array::from_fn(|b8| {
+            std::array::from_fn(|l| if st.ref_idx[l][b8] >= 0 { ref_id_of(slices, true, st, (row & 1) as u8, l, st.ref_idx[l][b8]) } else { u32::MAX })
+        })
+    };
+    let qids = ids8(&q, my);
+    let qm: [Motion; 16] = std::array::from_fn(|r| block_motion(&q, &qids, r));
+    let qp_of = |st: &MbState| if st.kind == MbKind::IPcm { 0 } else { st.qp as i32 };
+    let nz = |st: &MbState, r: usize| (st.nz_mask >> r) & 1 != 0;
+    // bS of a macroblock edge between block rp of p and block rq of the current macroblock
+    let mb_edge_bs = |p: &MbState, prow: usize, rp: usize, rq: usize, vertical: bool| -> u8 {
+        if p.kind.is_intra() || q.kind.is_intra() {
+            return if vertical || (!p.field && !q.field) { 4 } else { 3 };
+        }
+        if nz(p, rp) || nz(&q, rq) {
+            return 2;
+        }
+        if p.field != q.field {
+            return 1;
+        }
+        let pids = ids8(p, prow);
+        motion_bs(&block_motion(p, &pids, rp), &qm[rq], if q.field { 2 } else { 4 })
+    };
+    let t8 = q.transform_8x8;
+    let ylim = if q.field { 2 } else { 4 };
+    // internal edges: bS[dir][edge][segment]
+    let mut bs_int = [[[0u8; 4]; 4]; 2];
+    for dir in 0..2 {
+        for e in 1..4 {
+            if t8 && e % 2 == 1 {
+                continue;
+            }
+            for k in 0..4 {
+                let (rq, rp) = if dir == 0 { (k * 4 + e, k * 4 + e - 1) } else { (e * 4 + k, e * 4 + k - 4) };
+                bs_int[dir][e][k] = if q.kind.is_intra() {
+                    3
+                } else if nz(&q, rp) || nz(&q, rq) {
+                    2
+                } else {
+                    motion_bs(&qm[rp], &qm[rq], ylim)
+                };
+            }
+        }
+    }
+    let q_qp = qp_of(&q);
+    // ---- left macroblock edge
+    if mx > 0 && usable(2 * py * mb_w + mx - 1) {
+        let lt = 2 * py * mb_w + mx - 1;
+        let lfield = pic.mbs[lt].field;
+        if lfield == q.field {
+            // same structure: the macroblock at the same position of the left pair
+            let pi = idx - 1;
+            let p = pic.mbs[pi];
+            let b: [u8; 4] = std::array::from_fn(|k| mb_edge_bs(&p, my, k * 4 + 3, k * 4, true));
+            if b != [0; 4] {
+                let ep = edge_params(qp_of(&p), q_qp, b, alpha_off, beta_off);
+                if ep.alpha != 0 && ep.beta != 0 {
+                    filter_vertical::<16>(&mut pic.planes.y[lo..], ls, mx * 16, ly0, &ep, false);
+                }
+                for c in 0..2 {
+                    let ep = edge_params(p.qpc[c] as i32, q.qpc[c] as i32, b, alpha_off, beta_off);
+                    if ep.alpha != 0 && ep.beta != 0 {
+                        let plane = if c == 0 { &mut pic.planes.cb } else { &mut pic.planes.cr };
+                        filter_vertical::<8>(&mut plane[co..], cs, mx * 8, cy0, &ep, true);
+                    }
+                }
+            }
+        } else {
+            // mixed frame / field pairs: each line has its own left macroblock (6.4.12.2)
+            let left_of =
+                |line: usize, h: usize| -> (usize, usize) { if lfield { (lt + (line & 1) * mb_w, line >> 1) } else { (lt + (line / h) * mb_w, line % h) } };
+            let mut bs_row = [0u8; 16];
+            for r in 0..16 {
+                let line = if q.field { 2 * r + bottom } else { 16 * bottom + r };
+                let (pi, prow) = left_of(line, 16);
+                let p = pic.mbs[pi];
+                bs_row[r] = mb_edge_bs(&p, pi / mb_w, (prow / 4) * 4 + 3, (r / 4) * 4, true);
+                let ep = edge_params(qp_of(&p), q_qp, [bs_row[r]; 4], alpha_off, beta_off);
+                let o = lo + (ly0 + r) * ls + mx * 16 - 4;
+                filter_line(&mut pic.planes.y, o, 1, bs_row[r], &ep, false);
+            }
+            for k in 0..8 {
+                let line = if q.field { 2 * k + bottom } else { 8 * bottom + k };
+                let (pi, _) = left_of(line, 8);
+                let p = pic.mbs[pi];
+                // the luma line of the same field
+                let lr = if q.field { 2 * k } else { 4 * (k >> 1) + (k & 1) };
+                let b = bs_row[lr];
+                for c in 0..2 {
+                    let ep = edge_params(p.qpc[c] as i32, q.qpc[c] as i32, [b; 4], alpha_off, beta_off);
+                    let o = co + (cy0 + k) * cs + mx * 8 - 4;
+                    let plane = if c == 0 { &mut pic.planes.cb } else { &mut pic.planes.cr };
+                    filter_line(plane, o, 1, b, &ep, true);
+                }
+            }
+        }
+    }
+    // ---- internal vertical edges
+    for e in 1..4 {
+        let b = bs_int[0][e];
+        if b == [0; 4] {
+            continue;
+        }
+        let ep = edge_params(q_qp, q_qp, b, alpha_off, beta_off);
+        if ep.alpha != 0 && ep.beta != 0 {
+            filter_vertical::<16>(&mut pic.planes.y[lo..], ls, mx * 16 + e * 4, ly0, &ep, false);
+        }
+        if e == 2 {
+            for c in 0..2 {
+                let ep = edge_params(q.qpc[c] as i32, q.qpc[c] as i32, b, alpha_off, beta_off);
+                if ep.alpha != 0 && ep.beta != 0 {
+                    let plane = if c == 0 { &mut pic.planes.cb } else { &mut pic.planes.cr };
+                    filter_vertical::<8>(&mut plane[co..], cs, mx * 8 + 4, cy0, &ep, true);
+                }
+            }
+        }
+    }
+    // ---- top macroblock edge: list of (p macroblock, luma view offset / stride / q0 row, chroma ditto)
+    let mut top_edges: Vec<(usize, usize, usize, usize, usize, usize, usize)> = Vec::new();
+    if !q.field && bottom == 1 {
+        // frame macroblock below the top macroblock of its pair
+        top_edges.push((idx - mb_w, lo, ls, ly0, co, cs, cy0));
+    } else if py > 0 && usable(2 * (py - 1) * mb_w + mx) {
+        let at = 2 * (py - 1) * mb_w + mx;
+        let ab = at + mb_w;
+        let afield = pic.mbs[at].field;
+        if q.field {
+            // field macroblock: the line above in the same field (the above pair's macroblock
+            // holding it)
+            let pi = if afield { at + bottom * mb_w } else { ab };
+            top_edges.push((pi, lo, ls, ly0, co, cs, cy0));
+        } else if !afield {
+            top_edges.push((ab, lo, ls, ly0, co, cs, cy0));
+        } else {
+            // frame macroblock under a field pair: filtered as two field edges
+            // (fieldModeInFrameFilteringFlag), each against the field macroblock of its parity
+            for f in 0..2 {
+                top_edges.push((at + f * mb_w, f * w, 2 * w, 16 * py, f * cw, 2 * cw, 8 * py));
+            }
+        }
+    }
+    for (pi, lo2, ls2, ly2, co2, cs2, cy2) in top_edges {
+        let p = pic.mbs[pi];
+        let b: [u8; 4] = std::array::from_fn(|k| mb_edge_bs(&p, pi / mb_w, 12 + k, k, false));
+        if b == [0; 4] {
+            continue;
+        }
+        let ep = edge_params(qp_of(&p), q_qp, b, alpha_off, beta_off);
+        if ep.alpha != 0 && ep.beta != 0 {
+            filter_horizontal::<16>(&mut pic.planes.y[lo2..], ls2, mx * 16, ly2, &ep, false);
+        }
+        for c in 0..2 {
+            let ep = edge_params(p.qpc[c] as i32, q.qpc[c] as i32, b, alpha_off, beta_off);
+            if ep.alpha != 0 && ep.beta != 0 {
+                let plane = if c == 0 { &mut pic.planes.cb } else { &mut pic.planes.cr };
+                filter_horizontal::<8>(&mut plane[co2..], cs2, mx * 8, cy2, &ep, true);
+            }
+        }
+    }
+    // ---- internal horizontal edges
+    for e in 1..4 {
+        let b = bs_int[1][e];
+        if b == [0; 4] {
+            continue;
+        }
+        let ep = edge_params(q_qp, q_qp, b, alpha_off, beta_off);
+        if ep.alpha != 0 && ep.beta != 0 {
+            filter_horizontal::<16>(&mut pic.planes.y[lo..], ls, mx * 16, ly0 + e * 4, &ep, false);
+        }
+        if e == 2 {
+            for c in 0..2 {
+                let ep = edge_params(q.qpc[c] as i32, q.qpc[c] as i32, b, alpha_off, beta_off);
+                if ep.alpha != 0 && ep.beta != 0 {
+                    let plane = if c == 0 { &mut pic.planes.cb } else { &mut pic.planes.cr };
+                    filter_horizontal::<8>(&mut plane[co..], cs, mx * 8, cy0 + 4, &ep, true);
                 }
             }
         }

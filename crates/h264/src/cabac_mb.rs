@@ -49,6 +49,9 @@ impl SliceDecoder<'_> {
         let start = self.sh.header_bits.div_ceil(8) * 8;
         let init = if self.sh.slice_type.is_intra() { 3 } else { self.sh.cabac_init_idc as usize };
         let mut c = Cabac::new(rbsp, start, self.sh.qp(self.pps), init)?;
+        if self.mbaff {
+            return self.decode_cabac_mbaff(&mut c);
+        }
         let total = self.mb_w * self.mb_h;
         let mut addr = self.sh.first_mb_in_slice as usize;
         let intra_slice = self.sh.slice_type.is_intra();
@@ -71,7 +74,7 @@ impl SliceDecoder<'_> {
         Ok(())
     }
 
-    fn decode_skip_flag(&mut self, c: &mut Cabac) -> bool {
+    pub(crate) fn decode_skip_flag(&mut self, c: &mut Cabac) -> bool {
         let cond = |n: Option<usize>| n.map(|m| !self.pic.mbs[m].kind_is_skip()).unwrap_or(false) as usize;
         let inc = cond(self.nb[0]) + cond(self.nb[1]);
         let base = if self.sh.slice_type.is_b() { 24 } else { 11 };
@@ -186,12 +189,17 @@ impl SliceDecoder<'_> {
     /// ref_idx_lX for the partition whose top-left 4x4 block is (x, y) (9.3.3.1.1.6).
     fn decode_ref_idx(&mut self, c: &mut Cabac, list: usize, x: usize, y: usize) -> u32 {
         let cond = |xx: i32, yy: i32| -> usize {
-            let (mb, bx, by) = if xx < 0 {
-                (self.nb[0], 3usize, yy as usize)
-            } else if yy < 0 {
-                (self.nb[1], xx as usize, 3usize)
-            } else {
+            let (mb, bx, by) = if xx >= 0 && yy >= 0 {
                 (Some(self.mb_addr), xx as usize, yy as usize)
+            } else if self.mbaff {
+                match self.nb_blk4_mbaff(xx, yy) {
+                    Some((m, r)) => (Some(m), r & 3, r >> 2),
+                    None => (None, 0, 0),
+                }
+            } else if xx < 0 {
+                (self.nb[0], 3usize, yy as usize)
+            } else {
+                (self.nb[1], xx as usize, 3usize)
             };
             let Some(m) = mb else { return 0 };
             let st = &self.pic.mbs[m];
@@ -199,7 +207,9 @@ impl SliceDecoder<'_> {
             if st.kind.is_intra() || st.kind_is_skip() || st.direct8x8 & (1 << b8) != 0 {
                 return 0;
             }
-            (st.ref_idx[list][b8] > 0) as usize
+            // refIdxZeroFlag: a field neighbour of a frame macroblock counts in field units
+            let thr = (self.mbaff && !self.field_mb && st.field) as i8;
+            (st.ref_idx[list][b8] > thr) as usize
         };
         let inc = cond(x as i32 - 1, y as i32) + 2 * cond(x as i32, y as i32 - 1);
         let mut v = 0u32;
@@ -221,15 +231,25 @@ impl SliceDecoder<'_> {
     /// One mvd component for the (sub-)partition with top-left 4x4 block (x, y) (9.3.3.1.1.7, UEG3).
     fn decode_mvd(&mut self, c: &mut Cabac, list: usize, comp: usize, x: usize, y: usize) -> i32 {
         let absn = |xx: i32, yy: i32| -> u32 {
-            let (mb, bx, by) = if xx < 0 {
-                (self.nb[0], 3usize, yy as usize)
-            } else if yy < 0 {
-                (self.nb[1], xx as usize, 3usize)
-            } else {
+            let (mb, bx, by) = if xx >= 0 && yy >= 0 {
                 (Some(self.mb_addr), xx as usize, yy as usize)
+            } else if self.mbaff {
+                match self.nb_blk4_mbaff(xx, yy) {
+                    Some((m, r)) => (Some(m), r & 3, r >> 2),
+                    None => (None, 0, 0),
+                }
+            } else if xx < 0 {
+                (self.nb[0], 3usize, yy as usize)
+            } else {
+                (self.nb[1], xx as usize, 3usize)
             };
             match mb {
-                Some(m) => self.pic.mbs[m].mvd[list][by * 4 + bx][comp] as u32,
+                Some(m) => {
+                    let st = &self.pic.mbs[m];
+                    let v = st.mvd[list][by * 4 + bx][comp] as u32;
+                    // vertical mvd of a frame / field neighbour in the current macroblock's units
+                    if comp == 1 && self.mbaff && m != self.mb_addr && st.field != self.field_mb { if self.field_mb { v >> 1 } else { v << 1 } } else { v }
+                }
                 None => 0,
             }
         };
@@ -292,8 +312,28 @@ impl SliceDecoder<'_> {
         for b8 in 0..4usize {
             let (bx, by) = ((b8 & 1) * 2, (b8 >> 1) * 2);
             // A
-            let ca = if bx > 0 { ((luma >> (b8 - 1)) & 1 == 0) as usize } else { self.cbp_luma_cond(self.nb[0], b8 + 1) };
-            let cb = if by > 0 { ((luma >> (b8 - 2)) & 1 == 0) as usize } else { self.cbp_luma_cond(self.nb[1], b8 + 2) };
+            let nb8 = |xn: i32, yn: i32| -> (Option<usize>, usize) {
+                match self.nb_loc_mbaff(xn, yn, 16, 16) {
+                    Some((m, xw, yw)) => (Some(m), ((yw / 8) * 2 + xw / 8) as usize),
+                    None => (None, 0),
+                }
+            };
+            let ca = if bx > 0 {
+                ((luma >> (b8 - 1)) & 1 == 0) as usize
+            } else if self.mbaff {
+                let (m, n8) = nb8(-1, by as i32 * 4);
+                self.cbp_luma_cond(m, n8)
+            } else {
+                self.cbp_luma_cond(self.nb[0], b8 + 1)
+            };
+            let cb = if by > 0 {
+                ((luma >> (b8 - 2)) & 1 == 0) as usize
+            } else if self.mbaff {
+                let (m, n8) = nb8(bx as i32 * 4, -1);
+                self.cbp_luma_cond(m, n8)
+            } else {
+                self.cbp_luma_cond(self.nb[1], b8 + 2)
+            };
             let _ = (bx, by);
             let bin = c.decode_decision(73 + ca + 2 * cb);
             luma |= (bin as u8) << b8;
@@ -354,6 +394,12 @@ impl SliceDecoder<'_> {
         if bx >= 0 && by >= 0 {
             return (self.mb().nnz[(by * 4 + bx) as usize] != 0) as usize;
         }
+        if self.mbaff {
+            return match self.nb_blk4_mbaff(bx, by) {
+                Some((m, r)) => (self.pic.mbs[m].nnz[r] != 0) as usize,
+                None => intra_cur as usize,
+            };
+        }
         let n = if bx < 0 { self.nb[0] } else { self.nb[1] };
         let Some(m) = n else { return intra_cur as usize };
         let st = &self.pic.mbs[m];
@@ -373,6 +419,12 @@ impl SliceDecoder<'_> {
     fn cbf_chroma_ac_cond(&self, comp: usize, bx: i32, by: i32, intra_cur: bool) -> usize {
         if bx >= 0 && by >= 0 {
             return (self.mb().nnz_c[comp][(by * 2 + bx) as usize] != 0) as usize;
+        }
+        if self.mbaff {
+            return match self.nb_chroma_blk_mbaff(bx, by) {
+                Some((m, r)) => (self.pic.mbs[m].nnz_c[comp][r] != 0) as usize,
+                None => intra_cur as usize,
+            };
         }
         let n = if bx < 0 { self.nb[0] } else { self.nb[1] };
         let Some(m) = n else { return intra_cur as usize };
@@ -532,7 +584,7 @@ impl SliceDecoder<'_> {
     }
 
     /// Parse and reconstruct one macroblock_layer() with CABAC.
-    fn decode_mb_cabac(&mut self, c: &mut Cabac) -> Result<()> {
+    pub(crate) fn decode_mb_cabac(&mut self, c: &mut Cabac) -> Result<()> {
         let mut info = self.decode_mb_type(c)?;
         self.cur = MbCur { info, ..Default::default() };
         if info.kind == MbKind::IPcm {
@@ -557,7 +609,9 @@ impl SliceDecoder<'_> {
             self.mb_mut().transform_8x8 = true;
         }
         self.mb_mut().kind = info.kind;
-        let n_ref = self.sh.num_ref_idx_active;
+        // field macroblocks of MBAFF frames index field lists of twice the length (7.4.5.1)
+        let fm = if self.mbaff && self.field_mb { 2 } else { 1 };
+        let n_ref = [self.sh.num_ref_idx_active[0] * fm, self.sh.num_ref_idx_active[1] * fm];
         match info.kind {
             MbKind::I4x4 | MbKind::I8x8 => {
                 let n = if info.kind == MbKind::I8x8 { 4 } else { 16 };

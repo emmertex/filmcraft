@@ -33,14 +33,24 @@ oracles and fixture generators.
   8x8-transform edges.
 - Output: cropped 8-bit planar 4:2:0 pictures in output order with the caller's `pts`, POC, key
   flag, VUI colour description (range, primaries, transfer, matrix) and sample aspect ratio.
-- Interlaced streams (`frame_mbs_only_flag` 0) with field pictures (PAFF): complementary field
-  pairs share a frame buffer in the DPB, field reference lists (8.2.4.2.5 parity alternation),
-  field picture numbers in list modification and MMCOs, non-paired fields, field POCs, field scans
-  and CABAC field contexts, the chroma vector offset for opposite-parity references, field
-  deblocking (bS 3 on horizontal intra MB edges, field units for motion differences) and direct
-  prediction / co-location across frame and field pictures (Tables 8-6, 8-8). Output is one
-  interleaved frame per frame or field pair (`Picture::interlaced`); a field without its pair
-  repeats its lines. Frame pictures of interlaced streams without MBAFF decode as well.
+- Interlaced streams (`frame_mbs_only_flag` 0):
+  - Field pictures (PAFF): complementary field pairs share a frame buffer in the DPB, field
+    reference lists (8.2.4.2.5 parity alternation), field picture numbers in list modification and
+    MMCOs, non-paired fields, field POCs, field scans and CABAC field contexts, the chroma vector
+    offset for opposite-parity references, field deblocking (bS 3 on horizontal intra MB edges,
+    field units for motion differences).
+  - MBAFF frames: macroblock pair addressing, `mb_field_decoding_flag` (CABAC contexts, inference
+    for skipped pairs, CAVLC / CABAC skip runs across a pair), neighbour derivation for frame /
+    field pairs (6.4.12.2) in motion vector prediction (field / frame scaling of vectors and
+    reference indices), intra prediction and modes, CAVLC nC and every CABAC ctxIdxInc; field
+    macroblocks predict from the fields of the reference frames (field lists, chroma offsets,
+    explicit and implicit weights per field); deblocking of mixed frame / field edges (per-line
+    left edges, two field passes on the top edge of a frame macroblock under a field pair).
+  - Frame pictures without MBAFF, and streams mixing frame and field pictures.
+  - Direct prediction and co-location across frame, field and MBAFF pictures (Tables 8-6, 8-8),
+    temporal direct with vertical vector scaling.
+  - Output is one interleaved frame per frame or field pair (`Picture::interlaced`, top field on
+    even lines); a field without its pair repeats its lines.
 - Frame-level multithreading (see below).
 - Draft mode for reduced-resolution playback (off by default): non-reference pictures skip the
   deblocking filter and are flagged `Picture::draft`; every other picture stays bit-exact.
@@ -55,7 +65,7 @@ let mut dec = Decoder::new(); // or Decoder::with_threads(n), Decoder::from_avcc
 for (pts, access_unit) in access_units {
     for pic in dec.decode(access_unit, pts)? {
         // pic.width / pic.height (cropped), pic.y / pic.u / pic.v, pic.y_stride / pic.uv_stride,
-        // pic.pts, pic.poc, pic.key, pic.color, pic.sar
+        // pic.pts, pic.poc, pic.key, pic.color, pic.sar, pic.interlaced
     }
 }
 for pic in dec.flush() { /* ... */ }
@@ -123,10 +133,16 @@ with ffmpeg + libx264; tests print a message and skip when `/opt/homebrew/bin/ff
   mode (`draft_mode_changes_only_flagged_non_reference_pictures`): on five B-pyramid / B-frame
   fixtures, single- and frame-threaded, every unflagged picture is bit-exact and only flagged
   pictures differ.
-- Interlaced (`tests/interlaced.rs`): PAFF streams from two `filmcraft-h264enc` field encoders
-  (one per parity, interleaved; CAVLC I/P top and bottom field first, CABAC with B fields, High
-  with 8x8 transforms, single- and multi-threaded) must equal the encoders' reconstructions
-  interleaved line by line, bit for bit; a trailing unpaired field is output with repeated lines.
+- Interlaced (`tests/interlaced.rs`), without a decoder as reference:
+  - PAFF streams from two `filmcraft-h264enc` field encoders (one per parity, interleaved; CAVLC
+    I/P top and bottom field first, CABAC with B fields, High with 8x8 transforms, single- and
+    multi-threaded) must equal the encoders' reconstructions interleaved line by line, bit for
+    bit; a trailing unpaired field is output with repeated lines.
+  - MBAFF and interlaced frame-picture streams from libx264 (CAVLC / CABAC, B pyramid, 4
+    references, weighted P, implicit weighted B, spatial and temporal direct, bottom field first,
+    multiple slices, deblocking offsets, 1080i with cropping, fake-interlaced) must equal x264's
+    own reconstruction (`dump-yuv`) bit for bit, single- and multi-threaded.
+  - Bit-flipped, truncated and dropped access units of PAFF and MBAFF streams never panic.
 - Vectorised kernels against their straightforward forms on random input: the deblocking edge
   filter against the per-line filter, the 4x4 / 8x8 inverse transforms against the per-column
   formulation.
@@ -213,7 +229,12 @@ file; `H264_BENCH_ITERS=n` (and `H264_THREADS=t`, `H264_DRAFT=1`) turns it into 
 
 ## Known gaps
 
-- MBAFF frames (`mb_adaptive_frame_field_flag` with frame pictures) return `Error::Unsupported`.
+- Interlaced streams are output as frames (no deinterlacing, no field-by-field output).
+  `constrained_intra_pred` next to MBAFF pairs of the other frame / field kind follows the per-sample
+  availability of 8.3.1.2; libx264 `--constrained-intra` MBAFF streams were seen to use the left
+  column of such pairs anyway, so those (rare) streams differ from x264's reconstruction.
+- Streams mixing field pictures and MBAFF frames (some AVCHD camcorders) follow the same code
+  paths but have no test stream yet (libx264 cannot produce field pictures).
 - Only 8-bit 4:2:0. High 10 / 4:2:2 / 4:4:4 / monochrome and lossless
   (`qpprime_y_zero_transform_bypass`) return `Error::Unsupported`.
 - FMO (slice groups), SP/SI slices, data partitioning (Extended profile), MVC/SVC NAL units.

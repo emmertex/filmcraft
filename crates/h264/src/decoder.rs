@@ -348,9 +348,6 @@ impl Decoder {
         if pps.num_slice_groups > 1 {
             return unsupported("slice groups (FMO)");
         }
-        if sps.mb_adaptive_frame_field && !sh.field_pic {
-            return unsupported("MBAFF frames (interlaced H.264 with mb_adaptive_frame_field_flag)");
-        }
         if matches!(sh.slice_type, SliceType::Sp | SliceType::Si) {
             return unsupported("SP/SI slices");
         }
