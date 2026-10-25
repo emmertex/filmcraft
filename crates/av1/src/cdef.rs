@@ -213,7 +213,8 @@ fn filter_uv420(fs: &FrameState, out: &mut [RowBand; 3], r: usize, c: usize, pri
     }
     // Displacements in the 8-wide padded block (make_taps uses PAD_STRIDE = 12).
     let taps = make_taps(fs, pri, sec, damping, dir).map(|(off, w, t, a)| {
-        let (dy, dx) = ((off + 2 * PAD_STRIDE as isize + 2).div_euclid(PAD_STRIDE as isize) - 2, (off + 2 * PAD_STRIDE as isize + 2).rem_euclid(PAD_STRIDE as isize) - 2);
+        let (dy, dx) =
+            ((off + 2 * PAD_STRIDE as isize + 2).div_euclid(PAD_STRIDE as isize) - 2, (off + 2 * PAD_STRIDE as isize + 2).rem_euclid(PAD_STRIDE as isize) - 2);
         (dy * S as isize + dx, w, t, a)
     });
     // g[0]: the centre samples, g[1 + t]: tap t, each as 32 lanes (U rows 0..4, then V rows

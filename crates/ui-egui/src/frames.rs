@@ -33,6 +33,10 @@ pub enum Target {
     MulticamGrid(ItemId, u8, u16),
     /// One angle of a multi-camera source (Edit Cameras thumbnails).
     MulticamAngle(ItemId, u32),
+    /// Composite of a sequence rendered live, never from a render preview: previews are
+    /// flattened over black, and the monitors' Transparency Grid and Alpha display mode need the
+    /// frame's alpha.
+    SequenceLive(ItemId),
 }
 
 /// Item jobs at this priority or a larger number are background work: thumbnails of the Project
@@ -71,10 +75,59 @@ pub fn draft_playback(playing: bool, scale: f32, enabled: bool) -> bool {
     enabled && playing && scale <= 0.5
 }
 
+/// A rendered frame as sRGB RGBA8: the color is the picture over black and the fourth byte is
+/// its alpha ([`filmcraft_render::Image::over_black_with_alpha_rgba8`]).
 pub struct Rgba {
     pub w: usize,
     pub h: usize,
     pub px: Vec<u8>,
+}
+
+impl Rgba {
+    /// The frame as a texture image: opaque (the picture over black), or with its alpha, so what
+    /// is painted under it shows through its transparent areas.
+    pub fn color_image(&self, alpha: bool) -> egui::ColorImage {
+        let pixels = if alpha {
+            self.px.as_chunks::<4>().0.iter().map(|p| gamma_premultiplied(*p)).collect()
+        } else {
+            self.px.as_chunks::<4>().0.iter().map(|p| egui::Color32::from_rgb(p[0], p[1], p[2])).collect()
+        };
+        egui::ColorImage::new([self.w, self.h], pixels)
+    }
+}
+
+/// A frame pixel (sRGB of the linear color premultiplied by alpha) as egui's color, which is the
+/// sRGB of the straight color multiplied by alpha.
+fn gamma_premultiplied([r, g, b, a]: [u8; 4]) -> egui::Color32 {
+    match a {
+        255 => egui::Color32::from_rgb(r, g, b),
+        0 => egui::Color32::TRANSPARENT,
+        _ => {
+            let straight = |v: u8| straight_srgb(a, v);
+            egui::Color32::from_rgba_unmultiplied(straight(r), straight(g), straight(b), a)
+        }
+    }
+}
+
+/// The sRGB of the straight color whose premultiplied value is sRGB `v` at alpha `a`, from a table
+/// made on first use: a frame with partial alpha would otherwise take two `powf` per channel per
+/// pixel on every upload.
+fn straight_srgb(a: u8, v: u8) -> u8 {
+    static TABLE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        use egui::ecolor::{gamma_u8_from_linear_f32, linear_f32_from_gamma_u8};
+        let mut t = vec![0u8; 256 * 256];
+        for a in 1..=255u8 {
+            let k = f32::from(a) / 255.0;
+            for v in 0..=255u8 {
+                if let Some(x) = t.get_mut(usize::from(a) * 256 + usize::from(v)) {
+                    *x = gamma_u8_from_linear_f32((linear_f32_from_gamma_u8(v) / k).min(1.0));
+                }
+            }
+        }
+        t
+    });
+    table.get(usize::from(a) * 256 + usize::from(v)).copied().unwrap_or(v)
 }
 
 struct Job {
@@ -951,12 +1004,14 @@ fn render_job(job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Services>, pr
                 o.composite_onto(&mut img.px, w, h);
             }
         }
-        return (Rgba { w: img.w, h: img.h, px: img.over_black_rgba8() }, true);
+        return (Rgba { w: img.w, h: img.h, px: img.over_black_with_alpha_rgba8() }, true);
     }
     let provider = provider(job, pool, services);
     let opts = filmcraft_render::RenderOptions { scale: job.scale, captions: true, ..Default::default() };
     let img = match job.key.target {
-        Target::Sequence(seq) | Target::SequencePlan(seq) => Some(filmcraft_render::render_sequence(&job.project, seq, job.time, opts, &provider)),
+        Target::Sequence(seq) | Target::SequencePlan(seq) | Target::SequenceLive(seq) => {
+            Some(filmcraft_render::render_sequence(&job.project, seq, job.time, opts, &provider))
+        }
         Target::Item(item) => filmcraft_render::render_item(&job.project, item, job.time, job.scale, &provider),
         Target::MulticamGrid(item, side, page) => {
             let side = (side > 0).then_some(side as usize);
@@ -967,7 +1022,7 @@ fn render_job(job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Services>, pr
         }
     };
     let rgba = match img {
-        Some(img) => Rgba { w: img.w, h: img.h, px: img.over_black_rgba8() },
+        Some(img) => Rgba { w: img.w, h: img.h, px: img.over_black_with_alpha_rgba8() },
         None => Rgba { w: 1, h: 1, px: vec![0, 0, 0, 255] },
     };
     (rgba, false)
@@ -989,6 +1044,27 @@ mod tests {
         // the scopes ask for the program frame at 40 while playing: never background
         assert!(!background_work(40, Target::Sequence(ItemId(1))));
         assert!(!background_work(50, Target::SequencePlan(ItemId(1))));
+    }
+
+    #[test]
+    fn the_straight_color_table_matches_the_formula() {
+        use egui::ecolor::{gamma_u8_from_linear_f32, linear_f32_from_gamma_u8};
+        for a in 1..=255u8 {
+            for v in 0..=255u8 {
+                let want = gamma_u8_from_linear_f32((linear_f32_from_gamma_u8(v) / (f32::from(a) / 255.0)).min(1.0));
+                assert_eq!(super::straight_srgb(a, v), want, "a {a} v {v}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_frame_goes_up_opaque_or_with_its_alpha() {
+        use egui::Color32;
+        // opaque red, transparent, and half-transparent white: linear 0.5 over black is sRGB 188
+        let img = super::Rgba { w: 3, h: 1, px: vec![255, 0, 0, 255, 0, 0, 0, 0, 188, 188, 188, 128] };
+        assert_eq!(img.color_image(false).pixels, [Color32::from_rgb(255, 0, 0), Color32::BLACK, Color32::from_rgb(188, 188, 188)]);
+        // egui's colors are the sRGB of the straight color times alpha: white at half is 128
+        assert_eq!(img.color_image(true).pixels, [Color32::from_rgb(255, 0, 0), Color32::TRANSPARENT, Color32::from_rgba_premultiplied(128, 128, 128, 128)]);
     }
 
     #[test]

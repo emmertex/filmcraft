@@ -221,8 +221,19 @@ impl<F: Clone> Dpb<F> {
     ) {
         self.close_pending();
         let mut unused = (prev_ref_frame_num + 1) % max_frame_num;
+        // Missing frames before the last `max_num_ref_frames` would be dropped by the sliding window
+        // (oldest FrameNumWrap first) before the gap ends, so only their POC / frame_num bookkeeping
+        // runs; building pictures for them would cost up to max_frame_num frames per access unit.
+        let gap = if frame_num >= unused { frame_num - unused } else { (frame_num % max_frame_num) + max_frame_num - unused };
+        let skip = gap.saturating_sub(max_num_ref_frames.max(1).try_into().unwrap_or(u32::MAX));
         let mut guard = 0;
         while unused != frame_num && guard < max_frame_num {
+            if guard < skip {
+                poc_state(unused);
+                unused = (unused + 1) % max_frame_num;
+                guard += 1;
+                continue;
+            }
             self.sliding_window(unused, max_frame_num, max_num_ref_frames);
             let (frame, poc, meta) = make_frame(unused);
             poc_state(unused);
@@ -450,7 +461,7 @@ impl<F: Clone> Dpb<F> {
         field: Option<u8>,
         cur: Option<usize>,
         cur_long: &mut Option<u32>,
-    ) -> bool {
+    ) -> Result<bool> {
         let mut had5 = false;
         let curr_pic_num = match field {
             None => cur_frame_num as i32,
@@ -508,6 +519,7 @@ impl<F: Clone> Dpb<F> {
                     }
                 }
                 3 => {
+                    ensure!(self.max_long_term_frame_idx.is_some_and(|max| m.long_term_frame_idx <= max), "MMCO long-term index exceeds the configured limit");
                     let pn = curr_pic_num - (m.difference_of_pic_nums_minus1 as i32 + 1);
                     let idx = m.long_term_frame_idx;
                     // the frame / field picNumX
@@ -561,6 +573,7 @@ impl<F: Clone> Dpb<F> {
                     had5 = true;
                 }
                 6 => {
+                    ensure!(self.max_long_term_frame_idx.is_some_and(|max| m.long_term_frame_idx <= max), "MMCO long-term index exceeds the configured limit");
                     for (i, e) in self.entries.iter_mut().enumerate() {
                         // the first field of the current frame keeps the index it shares
                         if Some(i) == cur {
@@ -581,7 +594,7 @@ impl<F: Clone> Dpb<F> {
             }
         }
         self.prune();
-        had5
+        Ok(had5)
     }
 
     /// Reference marking for the just-decoded picture and insertion into the DPB with output bumping.
@@ -596,8 +609,8 @@ impl<F: Clone> Dpb<F> {
         max_num_ref_frames: usize,
         meta: Arc<OutputMeta>,
         out: &mut Vec<Output<F>>,
-    ) {
-        self.store_frame(sh, frame, [poc, poc], max_frame_num, max_num_ref_frames, meta, out);
+    ) -> Result<()> {
+        self.store_frame(sh, frame, [poc, poc], max_frame_num, max_num_ref_frames, meta, out)
     }
 
     /// [`Dpb::store_picture`] for a frame with distinct field order counts (interlaced streams).
@@ -611,9 +624,12 @@ impl<F: Clone> Dpb<F> {
         max_num_ref_frames: usize,
         meta: Arc<OutputMeta>,
         out: &mut Vec<Output<F>>,
-    ) {
+    ) -> Result<()> {
         self.close_pending();
-        let (mark, long_idx, had5) = self.mark_current(sh, None, None, max_frame_num, max_num_ref_frames);
+        let (mark, long_idx, had5) = self.mark_current(sh, None, None, max_frame_num, max_num_ref_frames)?;
+        if mark == RefMark::Long {
+            ensure!(self.num_refs() < max_num_ref_frames.max(1), "long-term reference exceeds max_num_ref_frames");
+        }
         if had5 {
             // All earlier pictures are output before the current one (C.4.4).
             self.flush(out);
@@ -631,7 +647,7 @@ impl<F: Clone> Dpb<F> {
                 let min_poc = self.entries.iter().filter(|e| e.needed_for_output).map(|e| e.poc).min();
                 if min_poc.is_none_or(|m| poc < m) {
                     out.push(Output { frame, poc, meta });
-                    return;
+                    return Ok(());
                 }
                 if !self.bump(out) {
                     break;
@@ -659,6 +675,7 @@ impl<F: Clone> Dpb<F> {
             awaiting_second: false,
         });
         self.output_reordered(out);
+        Ok(())
     }
 
     /// Low-delay output: honour max_num_reorder_frames.
@@ -673,26 +690,33 @@ impl<F: Clone> Dpb<F> {
     /// Reference marking of the current picture (8.2.5.1): returns its marking, long-term frame
     /// index and whether MMCO 5 was executed. `field`: parity of a current field; `cur`: entry of
     /// the current frame when the field is a second field.
-    fn mark_current(&mut self, sh: &SliceHeader, field: Option<u8>, cur: Option<usize>, max_frame_num: u32, max_num_ref_frames: usize) -> (RefMark, u32, bool) {
+    fn mark_current(
+        &mut self,
+        sh: &SliceHeader,
+        field: Option<u8>,
+        cur: Option<usize>,
+        max_frame_num: u32,
+        max_num_ref_frames: usize,
+    ) -> Result<(RefMark, u32, bool)> {
         let mut mark = RefMark::Unused;
         let mut long_idx = 0;
         let mut had5 = false;
         if sh.nal_ref_idc == 0 {
-            return (mark, long_idx, had5);
+            return Ok((mark, long_idx, had5));
         }
         if sh.idr {
             if sh.long_term_reference {
                 self.max_long_term_frame_idx = Some(0);
-                return (RefMark::Long, 0, false);
+                return Ok((RefMark::Long, 0, false));
             }
             self.max_long_term_frame_idx = None;
-            return (RefMark::Short, 0, false);
+            return Ok((RefMark::Short, 0, false));
         }
         let mut cur_long = None;
         // second field of a reference pair whose first field is short-term: no sliding window
         let first_short = cur.and_then(|i| self.entries.get(i)).is_some_and(|e| e.field_mark.contains(&RefMark::Short));
         if sh.adaptive_ref_pic_marking {
-            had5 = self.apply_mmcos(&sh.mmcos, sh.frame_num, max_frame_num, field, cur, &mut cur_long);
+            had5 = self.apply_mmcos(&sh.mmcos, sh.frame_num, max_frame_num, field, cur, &mut cur_long)?;
         } else if !first_short {
             self.sliding_window(sh.frame_num, max_frame_num, max_num_ref_frames);
         }
@@ -706,7 +730,7 @@ impl<F: Clone> Dpb<F> {
                 self.sliding_window(sh.frame_num, max_frame_num, max_num_ref_frames);
             }
         }
-        (mark, long_idx, had5)
+        Ok((mark, long_idx, had5))
     }
 
     /// Store a decoded field (`parity`, order count `poc`). A second field (`second`) completes the
@@ -724,12 +748,12 @@ impl<F: Clone> Dpb<F> {
         max_num_ref_frames: usize,
         meta: Arc<OutputMeta>,
         out: &mut Vec<Output<F>>,
-    ) {
+    ) -> Result<()> {
         let cur = if second { self.entries.iter().position(|e| e.awaiting_second) } else { None };
         if !second {
             self.close_pending();
         }
-        let (mark, long_idx, had5) = self.mark_current(sh, Some(parity), cur, max_frame_num, max_num_ref_frames);
+        let (mark, long_idx, had5) = self.mark_current(sh, Some(parity), cur, max_frame_num, max_num_ref_frames)?;
         if had5 {
             self.close_pending();
             self.flush(out);
@@ -753,7 +777,7 @@ impl<F: Clone> Dpb<F> {
                 }
             }
             self.output_reordered(out);
-            return;
+            return Ok(());
         }
         // A non-reference first field that precedes everything waiting for output would be output
         // directly as a frame (C.4.5.2): keep it (one buffer over) until its second field arrives.
@@ -782,11 +806,81 @@ impl<F: Clone> Dpb<F> {
         };
         e.sync_mark();
         self.entries.push(e);
+        Ok(())
     }
 }
 
 impl<F: Clone> Default for Dpb<F> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta() -> Arc<OutputMeta> {
+        Arc::new(OutputMeta {
+            pts: 0,
+            key: false,
+            crop: (0, 0, 0, 0),
+            full_range: false,
+            colour_primaries: 2,
+            transfer_characteristics: 2,
+            matrix_coefficients: 2,
+            sar: (1, 1),
+            draft: false,
+        })
+    }
+
+    /// A huge frame_num jump must only materialise the frames the sliding window keeps (#2779).
+    #[test]
+    fn frame_num_gap_materialises_at_most_max_num_ref_frames() {
+        let mut dpb: Dpb<u32> = Dpb::new();
+        let m = meta();
+        let mut made = 0u32;
+        let mut make = |f: u32| {
+            made += 1;
+            (f, 0, m.clone())
+        };
+        let mut updated = Vec::new();
+        let mut upd = |f: u32| updated.push(f);
+        dpb.fill_frame_num_gap(0, 32768, 1 << 16, 4, &mut make, &mut upd);
+        assert!(made <= 4, "gap fill materialised {made} frames, expected <= 4");
+        assert_eq!(updated, (1..32768).collect::<Vec<u32>>());
+        let mut refs: Vec<u32> = dpb.entries.iter().filter(|e| e.mark == RefMark::Short).map(|e| e.frame_num).collect();
+        refs.sort_unstable();
+        assert_eq!(refs, vec![32764, 32765, 32766, 32767]);
+        assert!(dpb.entries.iter().all(|e| e.frame == e.frame_num));
+    }
+
+    /// Existing short-term references are still evicted by a gap no longer than the window.
+    #[test]
+    fn short_frame_num_gap_keeps_sliding_window_semantics() {
+        let mut dpb: Dpb<u32> = Dpb::new();
+        let m = meta();
+        for f in 0..2 {
+            dpb.entries.push(DpbEntry {
+                frame: f,
+                poc: 0,
+                frame_num: f,
+                long_term_frame_idx: 0,
+                mark: RefMark::Short,
+                needed_for_output: false,
+                non_existing: false,
+                meta: m.clone(),
+                field_poc: [0, 0],
+                field_mark: [RefMark::Short; 2],
+                fields: 3,
+                awaiting_second: false,
+            });
+        }
+        let mut make = |f: u32| (f, 0, m.clone());
+        let mut upd = |_f: u32| {};
+        dpb.fill_frame_num_gap(1, 5, 16, 4, &mut make, &mut upd);
+        let mut refs: Vec<u32> = dpb.entries.iter().filter(|e| e.mark == RefMark::Short).map(|e| e.frame_num).collect();
+        refs.sort_unstable();
+        assert_eq!(refs, vec![1, 2, 3, 4]);
     }
 }
