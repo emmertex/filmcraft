@@ -243,7 +243,7 @@ impl SliceDecoder<'_> {
                     }
                     self.start_mb_mbaff(addr, field);
                     self.decode_skip()?;
-                    self.pic.mb_done(self.mb_addr);
+                    self.pic.mb_done(self.mb_addr)?;
                     addr += 1;
                 }
                 if run > 0 && !r.more_rbsp_data() {
@@ -258,7 +258,7 @@ impl SliceDecoder<'_> {
             flag_read = false;
             self.start_mb_mbaff(addr, field);
             self.decode_mb_cavlc(r)?;
-            self.pic.mb_done(self.mb_addr);
+            self.pic.mb_done(self.mb_addr)?;
             addr += 1;
             if !r.more_rbsp_data() {
                 break;
@@ -322,7 +322,7 @@ impl SliceDecoder<'_> {
             } else {
                 self.decode_mb_cabac(c)?;
             }
-            self.pic.mb_done(self.mb_addr);
+            self.pic.mb_done(self.mb_addr)?;
             ensure!(!c.overrun(), "CABAC read past end of slice data");
             if !top && c.decode_terminate() == 1 {
                 break;

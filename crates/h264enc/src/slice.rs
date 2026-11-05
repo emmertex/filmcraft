@@ -7,7 +7,7 @@ use crate::dsp::{sad, sad16, satd, ssd};
 use crate::intra::{Edge4, Edge8, filter8, mode_available, pred_chroma, pred4x4, pred8x8, pred16x16};
 use crate::mbinfo::{MbInfo, MbKind, Mv, Part};
 use crate::nal::{SliceHeader, SliceType, nal};
-use crate::picture::{CHROMA_PAD, Frame, LUMA_PAD, RefPic, avg_into};
+use crate::picture::{CHROMA_PAD, Frame, LUMA_PAD, McBlock, RefPic, avg_into};
 use crate::syntax::{MbCode, NbCtx};
 use crate::tables::{BLK4_XY, FIELD4, FIELD8, NUM_CTX, RASTER_TO_BLK4, ZIGZAG4, ZIGZAG8, chroma_qp};
 use crate::transform::{
@@ -1387,7 +1387,7 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
         // sub-pel refinement with SATD
         let mut buf = [0u8; 256];
         let scost = |mv: Mv, buf: &mut [u8; 256]| -> u32 {
-            r.mc_luma(bx, by, mv, w, h, buf, 16);
+            r.mc_luma(McBlock { x: bx, y: by, w, h }, mv, buf, 16);
             satd(src, sstride, buf, 16, w, h) + ((lam * mv_bits(mv, mvp)) >> 8)
         };
         let mut bs = scost(best, &mut buf);
@@ -1421,9 +1421,9 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
 
     fn pred_block(&self, r: &RefPic, px: usize, py: usize, rect: (usize, usize, usize, usize), mv: Mv, y: &mut [u8; 256], u: &mut [u8; 64], v: &mut [u8; 64]) {
         let (x, yy, w, h) = rect;
-        r.mc_luma(px + x, py + yy, mv, w, h, &mut y[yy * 16 + x..], 16);
+        r.mc_luma(McBlock { x: px + x, y: py + yy, w, h }, mv, &mut y[yy * 16 + x..], 16);
         let co = (yy / 2) * 8 + x / 2;
-        r.mc_chroma((px + x) / 2, (py + yy) / 2, mv, w / 2, h / 2, &mut u[co..], &mut v[co..], 8);
+        r.mc_chroma(McBlock { x: (px + x) / 2, y: (py + yy) / 2, w: w / 2, h: h / 2 }, mv, (&mut u[co..], &mut v[co..]), 8);
     }
 
     fn cand_inter_info(c: &mut Cand, part: Part, refs: [[i8; 4]; 2], mvs: [[Mv; 4]; 2], mvds: [[Mv; 4]; 2]) {

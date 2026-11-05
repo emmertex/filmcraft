@@ -702,7 +702,7 @@ impl RefPic {
     pub fn luma_window(&self, x0: i32, y0: i32, w: usize, h: usize, out: &mut [u8], os: usize) {
         match self.structure.parity() {
             Some(p) if self.frame.interlaced => self.frame.field_luma_window(p, x0, y0, w, h, out, os),
-            _ => self.frame.luma_window(x0, y0, w, h, out, os),
+            _ => self.frame.luma_window((x0, y0), w, h, out, os),
         }
     }
 
@@ -710,7 +710,7 @@ impl RefPic {
     pub fn chroma_window(&self, c: usize, x0: i32, y0: i32, w: usize, h: usize, out: &mut [u8], os: usize) {
         match self.structure.parity() {
             Some(p) if self.frame.interlaced => self.frame.field_chroma_window(p, c, x0, y0, w, h, out, os),
-            _ => self.frame.chroma_window(c, x0, y0, w, h, out, os),
+            _ => self.frame.chroma_window(c, (x0, y0), w, h, out, os),
         }
     }
 }

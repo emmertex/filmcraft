@@ -547,6 +547,13 @@ impl Encoder {
         &self.cfg
     }
 
+    /// Run `f` on the encoder's worker threads (the calling thread without the `threads`
+    /// feature). The pool is idle between pictures, so input preparation such as colour
+    /// conversion that runs here does not queue behind work on the global rayon pool.
+    pub fn install<R: Send>(&self, f: impl FnOnce() -> R + Send) -> R {
+        self.pool.install(f)
+    }
+
     /// The SPS and PPS NAL units (without start codes).
     pub fn sps_pps(&self) -> (Vec<u8>, Vec<u8>) {
         (self.sps_nal.clone(), self.pps_nal.clone())

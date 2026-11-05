@@ -218,7 +218,7 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
                     (_, 7) => &mut self.cdf.palette_7_uv_color[ctx],
                     _ => &mut self.cdf.palette_8_uv_color[ctx],
                 };
-                let s = self.sd.read_symbol(cdf);
+                let s = self.sd.read_symbol_slice(cdf);
                 map[rr * 64 + cc] = order[s];
                 j -= 1;
             }
