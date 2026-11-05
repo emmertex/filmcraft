@@ -375,15 +375,16 @@ impl Decoder {
             let sps = spss[pps.sps_id as usize].as_ref().ok_or_else(|| Error::MissingParameterSet(format!("SPS {}", pps.sps_id)))?;
             // Before the header fields that depend on the SPS: they are validated for the streams
             // we decode (a 10-bit slice may have a QP below 0), so a stream we cannot decode must
-            // fail as unsupported here, not as invalid there (#626).
-            sps.check_supported()?;
+            // fail as unsupported here, not as invalid there (#626). The software decoder decodes
+            // interlaced (field / MBAFF) streams too, so this is check_decodable, not the
+            // progressive-only check_supported the hardware paths use.
+            sps.check_decodable()?;
             found = Some((pps.clone(), sps.clone()));
             Ok((&**pps, &**sps))
         })?;
         let Some((pps, sps)) = found else {
             return Err(Error::MissingParameterSet("PPS".into()));
         };
-        sps.check_decodable()?;
         if pps.num_slice_groups > 1 {
             return unsupported("slice groups (FMO)");
         }
